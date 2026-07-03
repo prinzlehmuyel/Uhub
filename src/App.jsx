@@ -686,113 +686,497 @@ function Assignments({ uid, userData, onUpdate }) {
   );
 }
 
-// ─── NOTES LIBRARY ────────────────────────────────────────────────────────────
-function Notes({ uid, userData, onUpdate }) {
-  const [notes, setNotes]   = useState(userData.notes || []);
-  const [modal, setModal]   = useState(false);
-  const [title, setTitle]   = useState("");
-  const [course, setCourse] = useState("");
-  const [type, setType]     = useState("PDF");
-  const [url, setUrl]       = useState("");
-  const [search, setSearch] = useState("");
-  const [toast, setToast]   = useState("");
-  const courseOpts = (userData.courses || []).map(c => ({ value: c.code, label: `${c.code} - ${c.title}` }));
+// ─── LIBRARY SYSTEM ───────────────────────────────────────────────────────────
+
+// Shared public notes store — persists across all users in localStorage
+// When Firebase is connected, replace with a "publicNotes" Firestore collection
+const publicStore = {
+  getAll:  ()      => JSON.parse(localStorage.getItem("uhub_public_notes") || "[]"),
+  save:    (notes) => localStorage.setItem("uhub_public_notes", JSON.stringify(notes)),
+  add(note) {
+    const notes = this.getAll(); notes.unshift(note); this.save(notes);
+  },
+  remove(id) {
+    this.save(this.getAll().filter(n => n.id !== id));
+  },
+  update(id, changes) {
+    this.save(this.getAll().map(n => n.id === id ? { ...n, ...changes } : n));
+  },
+  incrementDownload(id) {
+    this.save(this.getAll().map(n => n.id === id ? { ...n, downloads: (n.downloads || 0) + 1 } : n));
+  },
+};
+
+// Profile-based access control
+function canViewNote(note, viewerProfile) {
+  if (!viewerProfile) return false;
+  switch (note.visibility) {
+    case "public":      return true;
+    case "faculty":     return viewerProfile.faculty     === note.uploaderFaculty;
+    case "department":  return viewerProfile.department  === note.uploaderDepartment;
+    case "level":       return viewerProfile.level       === note.uploaderLevel;
+    case "coursemates": return viewerProfile.department  === note.uploaderDepartment
+                            && viewerProfile.level       === note.uploaderLevel;
+    default:            return false;
+  }
+}
+
+const VISIBILITY_OPTIONS = [
+  { value: "private",     label: "🔒 Private",         desc: "Only you can see this note" },
+  { value: "public",      label: "🌍 Public",           desc: "Every UHub student" },
+  { value: "faculty",     label: "🏛 Faculty Only",     desc: "Students in your faculty" },
+  { value: "department",  label: "🎓 Department Only",  desc: "Students in your department" },
+  { value: "level",       label: "📅 Level Only",       desc: "All students in your level" },
+  { value: "coursemates", label: "👥 Coursemates Only", desc: "Same department + same level" },
+];
+
+const FILE_TYPES   = ["PDF", "Image", "PPTX", "DOCX", "Other"];
+const TYPE_ICON    = { PDF: "📄", PPTX: "📊", DOCX: "📝", Image: "🖼️", Other: "📎" };
+const VIS_VARIANT  = { private: "orange", public: "green", faculty: "blue", department: "blue", level: "blue", coursemates: "blue" };
+
+function Library({ uid, userData, user, onUpdate }) {
+  const profile    = user?.profile || {};
+  const courseOpts = (userData.courses || []).map(c => ({ value: c.code, label: `${c.code} – ${c.title}` }));
+
+  // ── Tab ────────────────────────────────────────────────────────────────────
+  const [activeTab, setActiveTab] = useState("private");
+
+  // ── Private library state ──────────────────────────────────────────────────
+  const [myNotes,  setMyNotes]  = useState(userData.notes || []);
+  const [privSearch, setPrivSearch] = useState("");
+  const [showUpload, setShowUpload] = useState(false);
+  const [editTarget, setEditTarget] = useState(null);
+
+  // ── Upload / edit form state ───────────────────────────────────────────────
+  const [fTitle, setFTitle]         = useState("");
+  const [fCourse, setFCourse]       = useState("");
+  const [fType, setFType]           = useState("PDF");
+  const [fUrl, setFUrl]             = useState("");
+  const [fDesc, setFDesc]           = useState("");
+  const [fVis, setFVis]             = useState("private");
+
+  // ── Public library state ───────────────────────────────────────────────────
+  const [pubNotes,   setPubNotes]   = useState([]);
+  const [pubSearch,  setPubSearch]  = useState("");
+  const [fCourseQ,   setFCourseQ]   = useState("");
+  const [fDept,      setFDept]      = useState("");
+  const [fLevel,     setFLevel]     = useState("");
+  const [fFileType,  setFFileType]  = useState("");
+  const [fUploader,  setFUploader]  = useState("");
+  const [showFilter, setShowFilter] = useState(false);
+  const [toast, setToast]           = useState("");
+
+  // Load public notes whenever tab switches to public
+  useEffect(() => {
+    if (activeTab === "public") {
+      const visible = publicStore.getAll().filter(n => canViewNote(n, profile));
+      setPubNotes(visible);
+    }
+  }, [activeTab]);
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 3000); };
 
-  const save = () => {
-    if (!title || !url) return;
-    const id = genId();
-    const updated = [...notes, { id, title, course, type, url, created: new Date().toISOString(), public: false }];
-    setNotes(updated); db.set(uid, "notes", updated); onUpdate();
-    setModal(false); setTitle(""); setCourse(""); setUrl(""); setType("PDF");
+  const resetForm = () => {
+    setFTitle(""); setFCourse(""); setFType("PDF");
+    setFUrl(""); setFDesc(""); setFVis("private");
+    setEditTarget(null); setShowUpload(false);
   };
 
-  const remove = (id) => {
-    const updated = notes.filter(n => n.id !== id);
-    setNotes(updated); db.set(uid, "notes", updated); onUpdate();
+  const openEdit = (note) => {
+    setFTitle(note.title); setFCourse(note.course || "");
+    setFType(note.type); setFUrl(note.url);
+    setFDesc(note.description || ""); setFVis(note.visibility || "private");
+    setEditTarget(note); setShowUpload(true);
   };
 
-  const shareNote = (id) => {
-    const updated = notes.map(n => n.id === id ? { ...n, public: true } : n);
-    setNotes(updated); db.set(uid, "notes", updated);
-    const shared = JSON.parse(localStorage.getItem("uhub_shared") || "{}");
-    shared[id] = { ...updated.find(n => n.id === id), ownerUid: uid };
-    localStorage.setItem("uhub_shared", JSON.stringify(shared));
-    onUpdate(); showToast("Note is now shareable! Copy the link.");
+  // ── Save note (new or edit) ────────────────────────────────────────────────
+  const saveNote = () => {
+    if (!fTitle.trim() || !fUrl.trim()) return;
+
+    if (editTarget) {
+      // Update in private store
+      const updated = myNotes.map(n => n.id === editTarget.id
+        ? { ...n, title: fTitle, course: fCourse, type: fType, url: fUrl, description: fDesc, visibility: fVis }
+        : n
+      );
+      setMyNotes(updated); db.set(uid, "notes", updated);
+
+      const wasPublic = editTarget.visibility !== "private";
+      const isPublic  = fVis !== "private";
+
+      if (wasPublic && isPublic) {
+        // Update public store entry
+        publicStore.update(editTarget.id, {
+          title: fTitle, course: fCourse, type: fType, url: fUrl,
+          description: fDesc, visibility: fVis,
+          uploaderFaculty: profile.faculty, uploaderDepartment: profile.department,
+          uploaderLevel: profile.level,
+        });
+      } else if (wasPublic && !isPublic) {
+        // Pulled from public
+        publicStore.remove(editTarget.id);
+        showToast("Note moved to private library.");
+      } else if (!wasPublic && isPublic) {
+        // Newly shared
+        publicStore.add({
+          ...updated.find(n => n.id === editTarget.id),
+          uploaderUid: uid, uploaderName: profile.name,
+          uploaderFaculty: profile.faculty, uploaderDepartment: profile.department,
+          uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0,
+        });
+        showToast("Note is now shared!");
+      }
+      onUpdate(); resetForm();
+    } else {
+      // New note
+      const id   = genId();
+      const note = {
+        id, title: fTitle, course: fCourse, type: fType, url: fUrl,
+        description: fDesc, visibility: fVis, created: new Date().toISOString(),
+      };
+      const updated = [note, ...myNotes];
+      setMyNotes(updated); db.set(uid, "notes", updated);
+
+      if (fVis !== "private") {
+        publicStore.add({
+          ...note,
+          uploaderUid: uid, uploaderName: profile.name,
+          uploaderFaculty: profile.faculty, uploaderDepartment: profile.department,
+          uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0,
+        });
+        showToast("Note uploaded and shared!");
+      } else {
+        showToast("Note saved to your private library.");
+      }
+      onUpdate(); resetForm();
+    }
   };
 
-  const copyLink = (id) => {
-    const link = `${window.location.origin}/share/${id}`;
-    navigator.clipboard?.writeText(link).then(() => showToast("Share link copied!")).catch(() => showToast("Link: " + link));
+  // ── Delete note ────────────────────────────────────────────────────────────
+  const deleteNote = (id) => {
+    const note    = myNotes.find(n => n.id === id);
+    const updated = myNotes.filter(n => n.id !== id);
+    setMyNotes(updated); db.set(uid, "notes", updated);
+    if (note?.visibility !== "private") publicStore.remove(id);
+    onUpdate();
   };
 
-  const typeIcon = { PDF: "📄", PPTX: "📊", DOCX: "📝", Image: "🖼️", Other: "📎" };
-  const filtered = notes.filter(n =>
-    n.title.toLowerCase().includes(search.toLowerCase()) ||
-    n.course.toLowerCase().includes(search.toLowerCase())
+  // ── Handle view/download from public library ───────────────────────────────
+  const handleDownload = (note) => {
+    publicStore.incrementDownload(note.id);
+    setPubNotes(prev => prev.map(n => n.id === note.id ? { ...n, downloads: (n.downloads || 0) + 1 } : n));
+    window.open(note.url, "_blank");
+  };
+
+  // ── Unpublish from public library (own notes only) ─────────────────────────
+  const unpublish = (noteId) => {
+    publicStore.remove(noteId);
+    setPubNotes(prev => prev.filter(n => n.id !== noteId));
+    const updated = myNotes.map(n => n.id === noteId ? { ...n, visibility: "private" } : n);
+    setMyNotes(updated); db.set(uid, "notes", updated);
+    onUpdate(); showToast("Note moved back to private library.");
+  };
+
+  // ── Filtered lists ─────────────────────────────────────────────────────────
+  const filteredMy = myNotes.filter(n => {
+    const q = privSearch.toLowerCase();
+    return !q || n.title.toLowerCase().includes(q)
+              || (n.course || "").toLowerCase().includes(q)
+              || (n.description || "").toLowerCase().includes(q);
+  });
+
+  const filteredPub = pubNotes.filter(n => {
+    const q = pubSearch.toLowerCase();
+    const matchQ   = !q || n.title.toLowerCase().includes(q)
+                       || (n.course || "").toLowerCase().includes(q)
+                       || (n.uploaderName || "").toLowerCase().includes(q);
+    const matchC   = !fCourseQ  || (n.course || "").toLowerCase().includes(fCourseQ.toLowerCase());
+    const matchD   = !fDept     || n.uploaderDepartment === fDept;
+    const matchL   = !fLevel    || n.uploaderLevel === fLevel;
+    const matchT   = !fFileType || n.type === fFileType;
+    const matchU   = !fUploader || (n.uploaderName || "").toLowerCase().includes(fUploader.toLowerCase());
+    return matchQ && matchC && matchD && matchL && matchT && matchU;
+  });
+
+  const visLabel = (v) => VISIBILITY_OPTIONS.find(o => o.value === v)?.label || v;
+  const activeFilters = [fCourseQ, fDept, fLevel, fFileType, fUploader].filter(Boolean).length;
+
+  // ── Visibility info line (contextual to user profile) ─────────────────────
+  const visInfo = () => {
+    const o = VISIBILITY_OPTIONS.find(o => o.value === fVis);
+    if (!o) return "";
+    let extra = "";
+    if (fVis === "coursemates") extra = ` (${profile.department || "your dept"} · ${profile.level || "your level"})`;
+    else if (fVis === "department") extra = ` (${profile.department || "your department"})`;
+    else if (fVis === "faculty")    extra = ` (${profile.faculty    || "your faculty"})`;
+    else if (fVis === "level")      extra = ` (${profile.level      || "your level"})`;
+    return o.desc + extra;
+  };
+
+  // ── Upload / Edit modal ────────────────────────────────────────────────────
+  const UploadModal = (
+    <Modal
+      title={editTarget ? "Edit Note" : "Upload Note"}
+      onClose={resetForm}
+    >
+      <Field label="Note Title" value={fTitle} onChange={setFTitle}
+        placeholder="e.g. Week 5 – Arrays & Pointers" required />
+
+      <Dropdown label="Course (optional)" value={fCourse} onChange={setFCourse} options={courseOpts} />
+
+      <div style={S.row2}>
+        <Dropdown label="File Type" value={fType} onChange={setFType} options={FILE_TYPES} />
+        <div style={S.formGroup}>
+          <label style={S.label}>Visibility <span style={{ color: RED }}>*</span></label>
+          <select value={fVis} onChange={e => setFVis(e.target.value)} style={S.select}>
+            {VISIBILITY_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {/* Dynamic visibility description */}
+      <div style={{ background: fVis === "private" ? "#FEF3C7" : BLUE_LIGHT,
+        borderRadius: 8, padding: "10px 14px", marginTop: -8, marginBottom: 16,
+        fontSize: 13, color: fVis === "private" ? "#92400E" : BLUE, fontWeight: 500 }}>
+        {visInfo()}
+      </div>
+
+      <Field label="File URL / Google Drive / Cloudinary Link" value={fUrl} onChange={setFUrl}
+        placeholder="https://drive.google.com/..." required />
+      <Field label="Description (optional)" value={fDesc} onChange={setFDesc}
+        placeholder="Briefly describe what this note covers..." />
+
+      <Btn onClick={saveNote} style={{ width: "100%" }}>
+        {editTarget ? "Save Changes" : fVis === "private" ? "Save to My Library" : "Upload & Share"}
+      </Btn>
+    </Modal>
   );
 
-  return (
-    <div style={S.page}>
-      <div style={S.sectionHeader}>
-        <h1 style={S.h1}>Notes Library</h1>
-        <Btn onClick={() => setModal(true)}>+ Upload</Btn>
+  // ── Private Library tab ─────────────────────────────────────────────────────
+  const PrivateTab = (
+    <>
+      <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+        <input value={privSearch} onChange={e => setPrivSearch(e.target.value)}
+          placeholder="🔍 Search your notes…"
+          style={{ ...S.input, flex: 1, background: GRAY }} />
+        <Btn onClick={() => { resetForm(); setShowUpload(true); }}>+ Upload</Btn>
       </div>
 
-      <div style={S.formGroup}>
-        <input value={search} onChange={e => setSearch(e.target.value)}
-          placeholder="🔍 Search notes..." style={{ ...S.input, background: GRAY }} />
-      </div>
-
-      {filtered.length === 0
-        ? <Empty icon="📚" title="No notes yet" subtitle="Upload lecture notes, slides, and materials organised by course"
-            action={<Btn onClick={() => setModal(true)}>Upload First Note</Btn>} />
-        : filtered.map(n => (
-          <div key={n.id} style={S.listItem}>
-            <div style={{ display: "flex", gap: 12, alignItems: "center", flex: 1 }}>
-              <div style={{ fontSize: 28 }}>{typeIcon[n.type] || "📎"}</div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600, fontSize: 14 }}>{n.title}</div>
-                <div style={{ display: "flex", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
-                  {n.course && <Badge>{n.course}</Badge>}
-                  <Badge variant={n.public ? "green" : "blue"}>{n.type}</Badge>
-                  {n.public && <Badge variant="green">🔗 Shared</Badge>}
-                </div>
+      {/* Summary strip */}
+      {myNotes.length > 0 && (
+        <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+          {["All", "PDF", "Image", "PPTX", "DOCX"].map(t => {
+            const count = t === "All" ? myNotes.length : myNotes.filter(n => n.type === t).length;
+            if (t !== "All" && count === 0) return null;
+            return (
+              <div key={t} style={{ background: GRAY, border: `1px solid ${BORDER}`, borderRadius: 8,
+                padding: "6px 14px", fontSize: 12, fontWeight: 600, color: MUTED }}>
+                {TYPE_ICON[t] || "📚"} {t} <span style={{ color: BLUE }}>{count}</span>
               </div>
+            );
+          })}
+        </div>
+      )}
+
+      {filteredMy.length === 0
+        ? <Empty icon="📁" title="Your private library is empty"
+            subtitle="Upload your first note and choose who can see it — keep it private or share with coursemates"
+            action={<Btn onClick={() => { resetForm(); setShowUpload(true); }}>Upload First Note</Btn>} />
+        : filteredMy.map(n => (
+          <div key={n.id} style={S.listItem}>
+            <div style={{ fontSize: 28, flexShrink: 0 }}>{TYPE_ICON[n.type] || "📎"}</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 700, fontSize: 14 }}>{n.title}</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 5 }}>
+                {n.course && <Badge>{n.course}</Badge>}
+                <Badge variant={VIS_VARIANT[n.visibility] || "blue"}>{visLabel(n.visibility)}</Badge>
+                <span style={S.muted}>{fmtDate(n.created)}</span>
+              </div>
+              {n.description && (
+                <div style={{ fontSize: 12, color: MUTED, marginTop: 4, lineHeight: 1.4 }}>{n.description}</div>
+              )}
             </div>
-            <div style={{ display: "flex", gap: 6, flexDirection: "column" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5, flexShrink: 0 }}>
               <Btn variant="outline" size="sm" onClick={() => window.open(n.url, "_blank")}>View</Btn>
-              {n.public
-                ? <Btn variant="gray" size="sm" onClick={() => copyLink(n.id)}>Copy Link</Btn>
-                : <Btn variant="gray" size="sm" onClick={() => shareNote(n.id)}>Share</Btn>
-              }
-              <Btn variant="red" size="sm" onClick={() => remove(n.id)}>✕</Btn>
+              <Btn variant="gray"    size="sm" onClick={() => openEdit(n)}>Edit</Btn>
+              <Btn variant="red"     size="sm" onClick={() => deleteNote(n.id)}>Delete</Btn>
             </div>
           </div>
         ))
       }
+    </>
+  );
 
-      {toast && (
-        <div style={{ position: "fixed", bottom: 80, left: 16, right: 16, background: GREEN, color: WHITE,
-          borderRadius: 12, padding: "14px 18px", display: "flex", justifyContent: "space-between",
-          alignItems: "center", zIndex: 300, boxShadow: "0 4px 16px rgba(0,0,0,0.2)" }}>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>✅ {toast}</span>
-          <button onClick={() => setToast("")} style={{ background: "none", border: "none", color: WHITE, fontSize: 18, cursor: "pointer" }}>✕</button>
+  // ── Public Library tab ──────────────────────────────────────────────────────
+  const PublicTab = (
+    <>
+      {/* Search + filter toggle */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+        <input value={pubSearch} onChange={e => setPubSearch(e.target.value)}
+          placeholder="🔍 Search notes, courses, uploaders…"
+          style={{ ...S.input, flex: 1, minWidth: 160, background: GRAY }} />
+        <Btn variant="outline" onClick={() => setShowFilter(!showFilter)}>
+          ⚙ Filters{activeFilters > 0 ? ` (${activeFilters})` : ""}
+        </Btn>
+      </div>
+
+      {/* Filter panel */}
+      {showFilter && (
+        <div style={{ ...S.card, padding: 16, marginBottom: 16, background: GRAY }}>
+          <div style={{ fontWeight: 700, fontSize: 13, color: TEXT, marginBottom: 12 }}>Filter Notes</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10 }}>
+            <div>
+              <label style={S.label}>Course Code</label>
+              <input value={fCourseQ} onChange={e => setFCourseQ(e.target.value)}
+                placeholder="e.g. CSC 301" style={S.input} />
+            </div>
+            <div>
+              <label style={S.label}>Department</label>
+              <input value={fDept} onChange={e => setFDept(e.target.value)}
+                placeholder="e.g. Computer Science" style={S.input} />
+            </div>
+            <div>
+              <label style={S.label}>Level</label>
+              <select value={fLevel} onChange={e => setFLevel(e.target.value)} style={S.select}>
+                <option value="">All Levels</option>
+                {LEVELS.map(l => <option key={l}>{l}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={S.label}>File Type</label>
+              <select value={fFileType} onChange={e => setFFileType(e.target.value)} style={S.select}>
+                <option value="">All Types</option>
+                {FILE_TYPES.map(t => <option key={t}>{t}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={S.label}>Uploader</label>
+              <input value={fUploader} onChange={e => setFUploader(e.target.value)}
+                placeholder="Search by name" style={S.input} />
+            </div>
+          </div>
+          {activeFilters > 0 && (
+            <Btn variant="gray" size="sm" style={{ marginTop: 12 }}
+              onClick={() => { setFCourseQ(""); setFDept(""); setFLevel(""); setFFileType(""); setFUploader(""); }}>
+              Clear All Filters
+            </Btn>
+          )}
         </div>
       )}
 
-      {modal && (
-        <Modal title="Upload Note" onClose={() => setModal(false)}>
-          <Field label="Note Title" value={title} onChange={setTitle} placeholder="e.g. Week 5 - Arrays & Pointers" required />
-          <Dropdown label="Course" value={course} onChange={setCourse} options={courseOpts} />
-          <Dropdown label="File Type" value={type} onChange={setType} options={["PDF","PPTX","DOCX","Image","Other"]} />
-          <Field label="File URL / Google Drive Link" value={url} onChange={setUrl} placeholder="https://drive.google.com/..." required />
-          <p style={{ ...S.muted, fontSize: 12, marginTop: -8, marginBottom: 16 }}>
-            Tip: Upload to Google Drive or Cloudinary and paste the link here.
-          </p>
-          <Btn onClick={save} style={{ width: "100%" }}>Save Note</Btn>
-        </Modal>
+      {/* Access context pill */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ fontSize: 12, color: MUTED }}>Showing notes you can access:</span>
+        <Badge variant="green">🌍 Public</Badge>
+        {profile.faculty    && <Badge>🏛 {profile.faculty}</Badge>}
+        {profile.department && <Badge>🎓 {profile.department}</Badge>}
+        {profile.level      && <Badge>📅 {profile.level}</Badge>}
+      </div>
+
+      <div style={{ fontSize: 12, color: MUTED, marginBottom: 12 }}>
+        {filteredPub.length} note{filteredPub.length !== 1 ? "s" : ""} available
+      </div>
+
+      {filteredPub.length === 0
+        ? <Empty icon="🌍" title="No shared notes found"
+            subtitle="Notes shared with your faculty, department, or level appear here. Upload and share to be the first!" />
+        : filteredPub.map(n => (
+          <div key={n.id} style={{ ...S.card, padding: 16, margin: "0 0 12px" }}>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+              <div style={{ fontSize: 32, flexShrink: 0 }}>{TYPE_ICON[n.type] || "📎"}</div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>{n.title}</div>
+                {n.description && (
+                  <div style={{ fontSize: 13, color: MUTED, marginBottom: 8, lineHeight: 1.4 }}>{n.description}</div>
+                )}
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                  {n.course && <Badge>{n.course}</Badge>}
+                  <Badge variant="blue">{n.type}</Badge>
+                  <Badge variant={n.visibility === "public" ? "green" : "blue"}>{visLabel(n.visibility)}</Badge>
+                </div>
+
+                {/* Uploader card */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+                  background: GRAY, borderRadius: 8, padding: "8px 12px" }}>
+                  <div style={{ width: 28, height: 28, background: BLUE, borderRadius: "50%",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: 12, color: WHITE, fontWeight: 800, flexShrink: 0 }}>
+                    {n.uploaderName?.[0] || "U"}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: TEXT }}>{n.uploaderName}</div>
+                    <div style={{ fontSize: 11, color: MUTED }}>
+                      {n.uploaderDepartment} · {n.uploaderLevel}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, color: MUTED, textAlign: "right" }}>
+                    <div>{fmtDate(n.uploadDate)}</div>
+                    <div style={{ color: BLUE, fontWeight: 600 }}>⬇ {n.downloads || 0} views</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
+                <Btn variant="blue" size="sm" onClick={() => handleDownload(n)}>⬇ View</Btn>
+                {n.uploaderUid === uid && (
+                  <Btn variant="gray" size="sm" onClick={() => unpublish(n.id)}>Unpublish</Btn>
+                )}
+              </div>
+            </div>
+          </div>
+        ))
+      }
+    </>
+  );
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+  return (
+    <div style={S.page}>
+      <div style={{ marginBottom: 20 }}>
+        <h1 style={S.h1}>📚 Library</h1>
+        <p style={{ ...S.muted, marginTop: 2 }}>
+          {profile.department} · {profile.level}
+        </p>
+      </div>
+
+      {/* Tab switcher */}
+      <div style={{ display: "flex", background: GRAY, borderRadius: 10, padding: 4, marginBottom: 20 }}>
+        {[
+          { key: "private", icon: "📁", label: "My Library",     count: myNotes.length },
+          { key: "public",  icon: "🌍", label: "Public Library", count: pubNotes.length },
+        ].map(t => (
+          <button key={t.key} onClick={() => setActiveTab(t.key)}
+            style={{ flex: 1, padding: "10px 6px", borderRadius: 8, border: "none", cursor: "pointer",
+              background: activeTab === t.key ? WHITE : "transparent",
+              boxShadow: activeTab === t.key ? "0 1px 6px rgba(0,0,0,0.1)" : "none",
+              transition: "all 0.2s" }}>
+            <div style={{ fontWeight: 700, fontSize: 14, color: activeTab === t.key ? BLUE : MUTED }}>
+              {t.icon} {t.label}
+            </div>
+            <div style={{ fontSize: 11, color: MUTED, marginTop: 2 }}>
+              {t.count} note{t.count !== 1 ? "s" : ""}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      {activeTab === "private" ? PrivateTab : PublicTab}
+
+      {showUpload && UploadModal}
+
+      {/* Toast */}
+      {toast && (
+        <div style={{ position: "fixed", bottom: 80, left: 16, right: 16, background: GREEN,
+          color: WHITE, borderRadius: 12, padding: "14px 18px", zIndex: 300,
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          boxShadow: "0 4px 16px rgba(0,0,0,0.2)" }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>✅ {toast}</span>
+          <button onClick={() => setToast("")}
+            style={{ background: "none", border: "none", color: WHITE, fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
       )}
     </div>
   );
@@ -1528,7 +1912,7 @@ const TABS = [
   { id: "dashboard",   label: "Home",    icon: "🏠" },
   { id: "courses",     label: "Courses", icon: "📖" },
   { id: "assignments", label: "Tasks",   icon: "✅" },
-  { id: "notes",       label: "Notes",   icon: "📄" },
+  { id: "notes",       label: "Library", icon: "📚" },
   { id: "flashcards",  label: "Cards",   icon: "🃏" },
   { id: "gpa",         label: "GPA",     icon: "📊" },
   { id: "exams",       label: "Exams",   icon: "⏰" },
@@ -1567,7 +1951,7 @@ export default function App() {
     dashboard:   <Dashboard   user={user}  userData={userData} />,
     courses:     <Courses     uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
     assignments: <Assignments uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
-    notes:       <Notes       uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
+    notes:       <Library     uid={user.uid} userData={userData} user={user} onUpdate={handleUpdate} />,
     flashcards:  <Flashcards  uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
     gpa:         <GPA         uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
     exams:       <ExamCountdown uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
@@ -1625,3 +2009,4 @@ export default function App() {
     </div>
   );
 }
+
