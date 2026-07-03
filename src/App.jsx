@@ -1,4 +1,24 @@
 import { useState, useEffect } from "react";
+import emailjs from "@emailjs/browser";
+
+// ─── EMAILJS CONFIG (set these in your .env file) ─────────────────────────────
+const EJS_SERVICE_ID  = import.meta.env.VITE_EMAILJS_SERVICE_ID  || "";
+const EJS_TEMPLATE_ID = import.meta.env.VITE_EMAILJS_TEMPLATE_ID || "";
+const EJS_PUBLIC_KEY  = import.meta.env.VITE_EMAILJS_PUBLIC_KEY  || "";
+
+// Send real verification email via EmailJS
+async function sendVerificationEmail(toEmail, toName, code) {
+  if (!EJS_SERVICE_ID || !EJS_TEMPLATE_ID || !EJS_PUBLIC_KEY) {
+    console.warn("EmailJS not configured — set VITE_EMAILJS_* in your .env");
+    return;
+  }
+  await emailjs.send(
+    EJS_SERVICE_ID,
+    EJS_TEMPLATE_ID,
+    { to_email: toEmail, to_name: toName, verification_code: code },
+    EJS_PUBLIC_KEY
+  );
+}
 
 // ─── THEME ───────────────────────────────────────────────────────────────────
 const BLUE       = "#1A56DB";
@@ -36,14 +56,13 @@ const db = {
 const authStore = {
   users: JSON.parse(localStorage.getItem("uhub_users") || "{}"),
 
-  // Generate a 6-digit code and store it mapped to the email
-  sendVerificationCode(email) {
+  // Generate a 6-digit code, store it, and return it
+  // The component is responsible for emailing it via sendVerificationEmail()
+  generateCode(email) {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const codes = JSON.parse(localStorage.getItem("uhub_vcodes") || "{}");
     codes[email] = code;
     localStorage.setItem("uhub_vcodes", JSON.stringify(codes));
-    // In production this would send an email — for mock we return the code
-    // so the UI can display "check your email" + show it in dev mode
     return code;
   },
 
@@ -307,94 +326,124 @@ function AuthScreen({ onAuth }) {
 // ─── EMAIL VERIFICATION SCREEN ────────────────────────────────────────────────
 function EmailVerification({ user, onVerified }) {
   const [code, setCode]       = useState("");
+  const [sending, setSending] = useState(false);
   const [sent, setSent]       = useState(false);
-  const [devCode, setDevCode] = useState(""); // shown in UI since this is mock/dev
-  const [error, setError]     = useState("");
+  const [sendError, setSendError] = useState("");
+  const [verifyError, setVerifyError] = useState("");
   const [success, setSuccess] = useState(false);
 
-  // Auto-send on mount
-  useEffect(() => {
-    const generated = authStore.sendVerificationCode(user.email);
-    setDevCode(generated);
-    setSent(true);
-  }, []);
+  // Generate code and send email on mount
+  useEffect(() => { doSend(); }, []);
 
-  const resend = () => {
-    const generated = authStore.sendVerificationCode(user.email);
-    setDevCode(generated);
-    setSent(true);
-    setError("");
-    setCode("");
+  const doSend = async () => {
+    setSending(true); setSendError(""); setCode("");
+    try {
+      const code = authStore.generateCode(user.email);
+      await sendVerificationEmail(user.email, user.profile?.name || "Student", code);
+      setSent(true);
+    } catch (e) {
+      setSendError("Could not send email. Check your EmailJS setup and try again.");
+      console.error("EmailJS error:", e);
+    } finally {
+      setSending(false);
+    }
   };
 
   const verify = () => {
-    if (!code.trim()) { setError("Please enter the 6-digit code"); return; }
+    if (code.length !== 6) { setVerifyError("Please enter the full 6-digit code"); return; }
     if (!authStore.checkVerificationCode(user.email, code)) {
-      setError("Incorrect code. Please try again."); return;
+      setVerifyError("Incorrect code — please check your email and try again."); return;
     }
     const updatedSession = authStore.markVerified(user.email);
     setSuccess(true);
-    setTimeout(() => onVerified(updatedSession), 1200);
+    setTimeout(() => onVerified(updatedSession), 1400);
   };
 
   return (
     <div style={S.authWrap}>
       <div style={S.authCard}>
+
+        {/* Header */}
         <div style={{ textAlign: "center", marginBottom: 24 }}>
           <div style={{ fontSize: 48, marginBottom: 8 }}>📧</div>
           <div style={{ fontSize: 22, fontWeight: 900, color: BLUE, letterSpacing: -0.5 }}>Verify your email</div>
-          <div style={{ fontSize: 13, color: MUTED, marginTop: 8 }}>
-            We sent a 6-digit code to<br />
-            <strong style={{ color: TEXT }}>{user.email}</strong>
+          <div style={{ fontSize: 13, color: MUTED, marginTop: 8, lineHeight: 1.6 }}>
+            {sending
+              ? "Sending verification code..."
+              : <>A 6-digit code has been sent to<br /><strong style={{ color: TEXT }}>{user.email}</strong></>
+            }
           </div>
         </div>
 
-        {/* DEV NOTICE — remove this block in production with real email sending */}
-        {devCode && !success && (
-          <div style={{ background: "#FEF3C7", border: "1px solid #F59E0B", borderRadius: 8, padding: "10px 14px", marginBottom: 16, fontSize: 13 }}>
-            <div style={{ fontWeight: 700, color: "#92400E", marginBottom: 2 }}>🛠 Dev mode — your code:</div>
-            <div style={{ fontFamily: "monospace", fontSize: 22, fontWeight: 900, color: "#92400E", letterSpacing: 6 }}>{devCode}</div>
-            <div style={{ color: "#92400E", fontSize: 11, marginTop: 2 }}>Remove this box when real email is connected</div>
+        {/* Send error */}
+        {sendError && (
+          <div style={{ background: "#FEE2E2", color: RED, padding: "12px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
+            <strong>Failed to send email:</strong> {sendError}
           </div>
         )}
 
+        {/* Success state */}
         {success ? (
-          <div style={{ background: "#D1FAE5", border: "1px solid #10B981", borderRadius: 8, padding: "14px", textAlign: "center" }}>
-            <div style={{ fontSize: 28, marginBottom: 4 }}>✅</div>
-            <div style={{ fontWeight: 700, color: "#065F46" }}>Email verified! Taking you in...</div>
+          <div style={{ background: "#D1FAE5", border: "1px solid #10B981", borderRadius: 10, padding: "20px", textAlign: "center" }}>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>✅</div>
+            <div style={{ fontWeight: 700, color: "#065F46", fontSize: 15 }}>Email verified!</div>
+            <div style={{ color: "#065F46", fontSize: 13, marginTop: 4 }}>Taking you to your dashboard...</div>
           </div>
         ) : (
           <>
-            {error && <div style={{ background: "#FEE2E2", color: RED, padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>{error}</div>}
+            {/* Verify error */}
+            {verifyError && (
+              <div style={{ background: "#FEE2E2", color: RED, padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
+                {verifyError}
+              </div>
+            )}
 
+            {/* Code input */}
             <div style={S.formGroup}>
               <label style={S.label}>Enter 6-digit code <span style={{ color: RED }}>*</span></label>
               <input
                 value={code}
-                onChange={e => { setCode(e.target.value.replace(/\D/g, "").slice(0, 6)); setError(""); }}
-                placeholder="e.g. 483920"
+                onChange={e => { setCode(e.target.value.replace(/\D/g, "").slice(0, 6)); setVerifyError(""); }}
+                placeholder="——————"
                 maxLength={6}
-                style={{ ...S.input, fontSize: 24, fontWeight: 700, letterSpacing: 8, textAlign: "center" }}
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                style={{ ...S.input, fontSize: 28, fontWeight: 800, letterSpacing: 10, textAlign: "center", padding: "14px" }}
                 onFocus={e => (e.target.style.borderColor = BLUE)}
                 onBlur={e  => (e.target.style.borderColor = BORDER)}
               />
+              <div style={{ fontSize: 12, color: MUTED, marginTop: 6, textAlign: "center" }}>
+                Check your inbox and spam folder
+              </div>
             </div>
 
-            <Btn onClick={verify} style={{ width: "100%", padding: "12px 0", fontSize: 15 }}
-              disabled={code.length !== 6}>
+            <Btn
+              onClick={verify}
+              disabled={code.length !== 6 || sending}
+              style={{ width: "100%", padding: "13px 0", fontSize: 15 }}
+            >
               Verify Email
             </Btn>
 
+            {/* Resend */}
             <div style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: MUTED }}>
               Didn't receive it?{" "}
-              <span onClick={resend} style={{ color: BLUE, fontWeight: 700, cursor: "pointer" }}>Resend code</span>
+              <span
+                onClick={!sending ? doSend : undefined}
+                style={{ color: sending ? MUTED : BLUE, fontWeight: 700, cursor: sending ? "default" : "pointer" }}
+              >
+                {sending ? "Sending..." : "Resend code"}
+              </span>
             </div>
           </>
         )}
 
+        {/* Switch account */}
         <div style={{ textAlign: "center", marginTop: 20 }}>
-          <span onClick={() => { authStore.logout(); window.location.reload(); }}
-            style={{ fontSize: 13, color: MUTED, cursor: "pointer", textDecoration: "underline" }}>
+          <span
+            onClick={() => { authStore.logout(); window.location.reload(); }}
+            style={{ fontSize: 13, color: MUTED, cursor: "pointer", textDecoration: "underline" }}
+          >
             Use a different account
           </span>
         </div>
@@ -904,106 +953,254 @@ function Flashcards({ uid, userData, onUpdate }) {
 }
 
 // ─── GPA CALCULATOR ───────────────────────────────────────────────────────────
+// Nigerian 5-point grading scale (UNIMAID standard)
+// A = 70–100 → 5 pts | B = 60–69 → 4 pts | C = 50–59 → 3 pts
+// D = 45–49  → 2 pts | E = 40–44 → 1 pt  | F = 0–39  → 0 pts
+//
+// Classification (CGPA):
+// 4.50–5.00 → First Class Honours
+// 3.50–4.49 → Second Class Upper (2:1)
+// 2.40–3.49 → Second Class Lower (2:2)
+// 1.50–2.39 → Third Class
+// 1.00–1.49 → Pass
+// 0.00–0.99 → Fail
+
+const GRADE_SCALE = [
+  { grade: "A", pts: 5, range: "70 – 100" },
+  { grade: "B", pts: 4, range: "60 – 69"  },
+  { grade: "C", pts: 3, range: "50 – 59"  },
+  { grade: "D", pts: 2, range: "45 – 49"  },
+  { grade: "E", pts: 1, range: "40 – 44"  },
+  { grade: "F", pts: 0, range: "0 – 39"   },
+];
+
+function classifyGPA(v) {
+  if (v >= 4.50) return { label: "First Class Honours",     color: "#065F46" };
+  if (v >= 3.50) return { label: "Second Class Upper (2:1)",color: BLUE      };
+  if (v >= 2.49) return { label: "Second Class Lower (2:2)",color: ORANGE    };
+  if (v >= 1.50) return { label: "Third Class",             color: "#92400E" };
+  if (v >= 1.00) return { label: "Pass",                    color: MUTED     };
+  if (v >  0)    return { label: "Fail",                    color: RED       };
+  return { label: "—", color: MUTED };
+}
+
 function GPA({ uid, userData, onUpdate }) {
   const courses = userData.courses || [];
   const [records, setRecords] = useState(userData.gpaRecords || []);
   const [grades, setGrades]   = useState({});
   const [semester, setSem]    = useState("1st Semester");
   const [saved, setSaved]     = useState(false);
+  const [showScale, setShowScale] = useState(false);
 
   const semCourses = courses.filter(c => c.semester === semester);
 
+  // How many courses in this semester already have a grade entered
+  const gradedCount = semCourses.filter(c => grades[c.id]).length;
+  const totalUnitsRegistered = semCourses.reduce((s, c) => s + c.units, 0);
+  const totalUnitsGraded     = semCourses.filter(c => grades[c.id]).reduce((s, c) => s + c.units, 0);
+
+  // ── GPA: only uses courses that have a grade entered ──────────────────────
   const calcGPA = () => {
     let pts = 0, units = 0;
-    semCourses.forEach(c => { const g = grades[c.id]; if (g) { pts += gradePoints[g] * c.units; units += c.units; } });
+    semCourses.forEach(c => {
+      const g = grades[c.id];
+      if (g) { pts += gradePoints[g] * c.units; units += c.units; }
+    });
     return units > 0 ? pts / units : 0;
   };
 
-  const calcCGPA = () => {
-    const allPts   = records.reduce((s, r) => s + r.totalPoints, 0);
-    const allUnits = records.reduce((s, r) => s + r.totalUnits, 0);
-    let curPts = 0, curUnits = 0;
-    semCourses.forEach(c => { const g = grades[c.id]; if (g) { curPts += gradePoints[g] * c.units; curUnits += c.units; } });
-    return (allUnits + curUnits) > 0 ? (allPts + curPts) / (allUnits + curUnits) : 0;
+  // ── CGPA: previous semesters (excluding current) + current semester live ──
+  // BUG FIX: we EXCLUDE the current semester from saved records to avoid
+  // double-counting if the student previously saved this semester already.
+  const calcCGPA = (overridePts, overrideUnits) => {
+    const prevRecords = records.filter(r => r.semester !== semester);
+    const prevPts   = prevRecords.reduce((s, r) => s + r.totalPoints, 0);
+    const prevUnits = prevRecords.reduce((s, r) => s + r.totalUnits, 0);
+    let curPts = overridePts ?? 0;
+    let curUnits = overrideUnits ?? 0;
+    if (overridePts === undefined) {
+      semCourses.forEach(c => {
+        const g = grades[c.id];
+        if (g) { curPts += gradePoints[g] * c.units; curUnits += c.units; }
+      });
+    }
+    return (prevUnits + curUnits) > 0 ? (prevPts + curPts) / (prevUnits + curUnits) : 0;
   };
 
   const saveRecord = () => {
+    if (gradedCount === 0) return;
     let tp = 0, tu = 0;
-    semCourses.forEach(c => { const g = grades[c.id]; if (g) { tp += gradePoints[g] * c.units; tu += c.units; } });
-    const rec = { id: genId(), semester, gpa: calcGPA(), cgpa: calcCGPA(), totalPoints: tp, totalUnits: tu, date: new Date().toISOString() };
-    const updated = [...records.filter(r => r.semester !== semester), rec];
+    semCourses.forEach(c => {
+      const g = grades[c.id];
+      if (g) { tp += gradePoints[g] * c.units; tu += c.units; }
+    });
+    // Pass computed tp/tu directly so CGPA isn't calculated from stale state
+    const cgpa = calcCGPA(tp, tu);
+    const rec = {
+      id: genId(), semester,
+      gpa: calcGPA(), cgpa,
+      totalPoints: tp, totalUnits: tu,
+      date: new Date().toISOString(),
+    };
+    const updated = [...records.filter(r => r.semester !== semester), rec]
+      .sort((a, b) => a.semester.localeCompare(b.semester));
     setRecords(updated); db.set(uid, "gpaRecords", updated); onUpdate();
-    setSaved(true); setTimeout(() => setSaved(false), 2000);
+    setSaved(true); setTimeout(() => setSaved(false), 2500);
   };
 
-  const classify = v => v >= 4.5 ? "First Class" : v >= 3.5 ? "Second Class Upper" : v >= 2.5 ? "Second Class Lower" : v >= 1.5 ? "Third Class" : v > 0 ? "Pass" : "—";
-  const gpa  = calcGPA();
-  const cgpa = calcCGPA();
+  const deleteRecord = (id) => {
+    const updated = records.filter(r => r.id !== id);
+    setRecords(updated); db.set(uid, "gpaRecords", updated); onUpdate();
+  };
+
+  const gpa   = calcGPA();
+  const cgpa  = calcCGPA();
+  const gpaC  = classifyGPA(gpa);
+  const cgpaC = classifyGPA(cgpa);
 
   return (
     <div style={S.page}>
-      <h1 style={{ ...S.h1, marginBottom: 20 }}>GPA & CGPA Calculator</h1>
+      <h1 style={{ ...S.h1, marginBottom: 4 }}>GPA & CGPA Calculator</h1>
+      <p style={{ ...S.muted, marginBottom: 20 }}>5-point scale · UNIMAID grading standard</p>
 
+      {/* Live result cards */}
       <div style={S.grid2}>
-        <div style={{ ...S.card, textAlign: "center", background: BLUE_LIGHT, border: `1px solid ${BLUE}22` }}>
-          <div style={{ fontSize: 36, fontWeight: 900, color: BLUE }}>{gpa.toFixed(2)}</div>
-          <div style={{ fontWeight: 600, color: MUTED, fontSize: 13 }}>Semester GPA</div>
-          <div style={{ fontSize: 12, color: BLUE, marginTop: 4 }}>{classify(gpa)}</div>
+        <div style={{ ...S.card, textAlign: "center", background: BLUE_LIGHT, border: `1px solid ${BLUE}33`, margin: 0 }}>
+          <div style={{ fontSize: 38, fontWeight: 900, color: BLUE, letterSpacing: -1 }}>{gpa.toFixed(2)}</div>
+          <div style={{ fontWeight: 600, color: MUTED, fontSize: 13, marginTop: 2 }}>Semester GPA</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: gpaC.color, marginTop: 6 }}>{gpaC.label}</div>
+          <div style={{ fontSize: 11, color: MUTED, marginTop: 4 }}>{gradedCount}/{semCourses.length} courses graded</div>
         </div>
-        <div style={{ ...S.card, textAlign: "center", background: "#F0FDF4", border: "1px solid #BBF7D0" }}>
-          <div style={{ fontSize: 36, fontWeight: 900, color: GREEN }}>{cgpa.toFixed(2)}</div>
-          <div style={{ fontWeight: 600, color: MUTED, fontSize: 13 }}>Cumulative CGPA</div>
-          <div style={{ fontSize: 12, color: GREEN, marginTop: 4 }}>{classify(cgpa)}</div>
+        <div style={{ ...S.card, textAlign: "center", background: "#F0FDF4", border: "1px solid #BBF7D0", margin: 0 }}>
+          <div style={{ fontSize: 38, fontWeight: 900, color: GREEN, letterSpacing: -1 }}>{cgpa.toFixed(2)}</div>
+          <div style={{ fontWeight: 600, color: MUTED, fontSize: 13, marginTop: 2 }}>Cumulative CGPA</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: cgpaC.color, marginTop: 6 }}>{cgpaC.label}</div>
+          <div style={{ fontSize: 11, color: MUTED, marginTop: 4 }}>Across {records.filter(r => r.semester !== semester).length + (gradedCount > 0 ? 1 : 0)} semester(s)</div>
         </div>
       </div>
 
-      <div style={S.card}>
+      {/* Grade entry card */}
+      <div style={{ ...S.card, marginTop: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
-          <h2 style={{ ...S.h2, margin: 0 }}>Enter Grades</h2>
-          <Dropdown label="" value={semester} onChange={setSem} options={["1st Semester","2nd Semester"]} />
+          <div>
+            <h2 style={{ ...S.h2, margin: 0 }}>Enter Grades</h2>
+            {semCourses.length > 0 &&
+              <div style={{ fontSize: 12, color: MUTED, marginTop: 2 }}>
+                {totalUnitsGraded}/{totalUnitsRegistered} credit units graded
+              </div>
+            }
+          </div>
+          <Dropdown label="" value={semester} onChange={v => { setSem(v); setGrades({}); }} options={["1st Semester","2nd Semester"]} />
         </div>
+
+        {/* Column headers */}
+        {semCourses.length > 0 && (
+          <div style={{ display: "flex", gap: 12, marginBottom: 8, paddingBottom: 8, borderBottom: `1px solid ${BORDER}` }}>
+            <div style={{ flex: 1, fontSize: 11, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: 0.5 }}>Course</div>
+            <div style={{ width: 80, fontSize: 11, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "center" }}>Grade</div>
+            <div style={{ width: 80, fontSize: 11, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "center" }}>Quality Pts</div>
+          </div>
+        )}
 
         {semCourses.length === 0
           ? <Empty icon="📊" title={`No courses in ${semester}`} subtitle="Add courses in the Courses tab first" />
-          : semCourses.map(c => (
-            <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600, fontSize: 14 }}>{c.code}</div>
-                <div style={S.muted}>{c.title} · {c.units} units</div>
+          : semCourses.map(c => {
+            const g = grades[c.id];
+            const qp = g ? gradePoints[g] * c.units : null;
+            return (
+              <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: 13 }}>{c.code}</div>
+                  <div style={{ fontSize: 12, color: MUTED }}>{c.title} · {c.units} unit{c.units !== 1 ? "s" : ""}</div>
+                </div>
+                <select
+                  value={g || ""}
+                  onChange={e => setGrades({ ...grades, [c.id]: e.target.value })}
+                  style={{ ...S.select, width: 80, padding: "8px 10px",
+                    borderColor: g ? BLUE : BORDER,
+                    color: g ? TEXT : MUTED,
+                    fontWeight: g ? 700 : 400 }}
+                >
+                  <option value="">—</option>
+                  {GRADE_SCALE.map(gs => (
+                    <option key={gs.grade} value={gs.grade}>
+                      {gs.grade} ({gs.pts})
+                    </option>
+                  ))}
+                </select>
+                <div style={{ width: 80, textAlign: "center", fontWeight: 800, fontSize: 14,
+                  color: qp !== null ? (qp >= 15 ? GREEN : qp >= 9 ? BLUE : qp >= 6 ? ORANGE : RED) : MUTED }}>
+                  {qp !== null ? qp : "—"}
+                </div>
               </div>
-              <select value={grades[c.id] || ""} onChange={e => setGrades({ ...grades, [c.id]: e.target.value })}
-                style={{ ...S.select, width: 80, padding: "8px 10px" }}>
-                <option value="">—</option>
-                {Object.keys(gradePoints).map(g => <option key={g}>{g}</option>)}
-              </select>
-              <div style={{ width: 44, textAlign: "center", fontWeight: 700, fontSize: 13, color: BLUE }}>
-                {grades[c.id] !== undefined && grades[c.id] !== "" ? gradePoints[grades[c.id]] * c.units : "—"}
-              </div>
-            </div>
-          ))
+            );
+          })
         }
-        {semCourses.length > 0 &&
-          <Btn onClick={saveRecord} variant={saved ? "green" : "blue"} style={{ marginTop: 8 }}>
+
+        {/* Totals row */}
+        {gradedCount > 0 && (
+          <div style={{ display: "flex", gap: 12, marginTop: 12, paddingTop: 12, borderTop: `1px solid ${BORDER}` }}>
+            <div style={{ flex: 1, fontWeight: 700, fontSize: 13 }}>Total</div>
+            <div style={{ width: 80, textAlign: "center", fontWeight: 700, fontSize: 13, color: MUTED }}>{totalUnitsGraded} units</div>
+            <div style={{ width: 80, textAlign: "center", fontWeight: 800, fontSize: 14, color: BLUE }}>
+              {semCourses.filter(c => grades[c.id]).reduce((s, c) => s + gradePoints[grades[c.id]] * c.units, 0)}
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
+          <Btn onClick={saveRecord} variant={saved ? "green" : "blue"} disabled={gradedCount === 0}>
             {saved ? "✓ Saved!" : "Calculate & Save"}
           </Btn>
-        }
+          <Btn variant="gray" onClick={() => setShowScale(!showScale)}>
+            {showScale ? "Hide" : "📋 View"} Grade Scale
+          </Btn>
+        </div>
+
+        {/* Grade scale reference */}
+        {showScale && (
+          <div style={{ marginTop: 16, borderRadius: 8, overflow: "hidden", border: `1px solid ${BORDER}` }}>
+            <div style={{ background: BLUE, color: WHITE, padding: "8px 12px", fontSize: 12, fontWeight: 700 }}>
+              UNIMAID Grade Scale (5-Point System)
+            </div>
+            {GRADE_SCALE.map(gs => (
+              <div key={gs.grade} style={{ display: "flex", padding: "8px 12px", borderBottom: `1px solid ${BORDER}`,
+                background: WHITE, fontSize: 13 }}>
+                <div style={{ width: 30, fontWeight: 800, color: BLUE }}>{gs.grade}</div>
+                <div style={{ width: 80, color: MUTED }}>{gs.range}</div>
+                <div style={{ fontWeight: 600 }}>{gs.pts} point{gs.pts !== 1 ? "s" : ""}</div>
+              </div>
+            ))}
+            <div style={{ padding: "8px 12px", background: GRAY, fontSize: 11, color: MUTED }}>
+              First Class: 4.50–5.00 · 2:1: 3.50–4.49 · 2:2: 2.49–3.49 · Third: 1.50–2.48
+            </div>
+          </div>
+        )}
       </div>
 
+      {/* GPA History */}
       {records.length > 0 && (
         <div style={S.card}>
-          <h2 style={S.h2}>GPA History</h2>
-          {records.map(r => (
-            <div key={r.id} style={{ ...S.listItem, marginBottom: 8 }}>
-              <div>
-                <div style={{ fontWeight: 600, fontSize: 14 }}>{r.semester}</div>
-                <div style={S.muted}>{fmtDate(r.date)}</div>
+          <h2 style={S.h2}>Semester History</h2>
+          {[...records].sort((a, b) => a.semester.localeCompare(b.semester)).map(r => {
+            const rc = classifyGPA(r.gpa);
+            return (
+              <div key={r.id} style={{ ...S.listItem, marginBottom: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{r.semester}</div>
+                  <div style={{ fontSize: 11, color: MUTED, marginTop: 2 }}>
+                    {r.totalUnits} credit units · {r.totalPoints} quality points · Saved {fmtDate(r.date)}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right", marginRight: 8 }}>
+                  <div style={{ fontWeight: 800, fontSize: 15, color: BLUE }}>GPA {r.gpa.toFixed(2)}</div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: rc.color }}>{rc.label}</div>
+                  <div style={{ fontSize: 11, color: MUTED }}>CGPA {r.cgpa.toFixed(2)}</div>
+                </div>
+                <Btn variant="red" size="sm" onClick={() => deleteRecord(r.id)}>✕</Btn>
               </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontWeight: 700, color: BLUE }}>GPA: {r.gpa.toFixed(2)}</div>
-                <div style={{ fontSize: 12, color: MUTED }}>CGPA: {r.cgpa.toFixed(2)}</div>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
