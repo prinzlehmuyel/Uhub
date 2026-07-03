@@ -9,15 +9,19 @@ const EJS_PUBLIC_KEY  = import.meta.env.VITE_EMAILJS_PUBLIC_KEY  || "";
 // Send real verification email via EmailJS
 async function sendVerificationEmail(toEmail, toName, code) {
   if (!EJS_SERVICE_ID || !EJS_TEMPLATE_ID || !EJS_PUBLIC_KEY) {
-    console.warn("EmailJS not configured — set VITE_EMAILJS_* in your .env");
-    return;
+    throw new Error(
+      "EmailJS is not configured. Add VITE_EMAILJS_SERVICE_ID, VITE_EMAILJS_TEMPLATE_ID and VITE_EMAILJS_PUBLIC_KEY to your .env file."
+    );
   }
-  await emailjs.send(
+  const result = await emailjs.send(
     EJS_SERVICE_ID,
     EJS_TEMPLATE_ID,
     { to_email: toEmail, to_name: toName, verification_code: code },
     EJS_PUBLIC_KEY
   );
+  if (result.status !== 200) {
+    throw new Error(`EmailJS returned status ${result.status}: ${result.text}`);
+  }
 }
 
 // ─── THEME ───────────────────────────────────────────────────────────────────
@@ -342,7 +346,8 @@ function EmailVerification({ user, onVerified }) {
       await sendVerificationEmail(user.email, user.profile?.name || "Student", code);
       setSent(true);
     } catch (e) {
-      setSendError("Could not send email. Check your EmailJS setup and try again.");
+      // Show the real error so the problem is easy to diagnose
+      setSendError(e?.message || "Unknown error — check the browser console for details.");
       console.error("EmailJS error:", e);
     } finally {
       setSending(false);
@@ -1620,4 +1625,3 @@ export default function App() {
     </div>
   );
 }
-
