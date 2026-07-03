@@ -24,6 +24,53 @@ async function sendVerificationEmail(toEmail, toName, code) {
   }
 }
 
+// ─── CLOUDINARY CONFIG ────────────────────────────────────────────────────────
+const CLD_CLOUD  = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME    || "";
+const CLD_PRESET = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET || "";
+
+// Accepted file types for the library
+const ACCEPTED_TYPES = ".pdf,.doc,.docx,.ppt,.pptx,.jpg,.jpeg,.png,.gif,.webp";
+const MAX_FILE_MB    = 10;
+
+function detectFileType(filename) {
+  const ext = filename.split(".").pop().toLowerCase();
+  if (ext === "pdf")                       return "PDF";
+  if (["ppt","pptx"].includes(ext))        return "PPTX";
+  if (["doc","docx"].includes(ext))        return "DOCX";
+  if (["jpg","jpeg","png","gif","webp"].includes(ext)) return "Image";
+  return "Other";
+}
+
+function uploadToCloudinary(file, onProgress) {
+  if (!CLD_CLOUD || !CLD_PRESET) {
+    return Promise.reject(new Error(
+      "Cloudinary is not configured. Add VITE_CLOUDINARY_CLOUD_NAME and " +
+      "VITE_CLOUDINARY_UPLOAD_PRESET to your .env file and Vercel settings."
+    ));
+  }
+  return new Promise((resolve, reject) => {
+    const fd = new FormData();
+    fd.append("file",           file);
+    fd.append("upload_preset",  CLD_PRESET);
+    fd.append("folder",         "uhub_library");
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `https://api.cloudinary.com/v1_1/${CLD_CLOUD}/auto/upload`);
+    xhr.upload.onprogress = (e) => {
+      if (onProgress && e.lengthComputable)
+        onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status === 200) {
+        resolve(JSON.parse(xhr.responseText).secure_url);
+      } else {
+        reject(new Error("Cloudinary upload failed: " + xhr.responseText));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Network error — check your connection and try again."));
+    xhr.send(fd);
+  });
+}
+
 // ─── THEME ───────────────────────────────────────────────────────────────────
 const BLUE       = "#1A56DB";
 const BLUE_LIGHT = "#EBF2FF";
@@ -751,9 +798,14 @@ function Library({ uid, userData, user, onUpdate }) {
   const [fTitle, setFTitle]         = useState("");
   const [fCourse, setFCourse]       = useState("");
   const [fType, setFType]           = useState("PDF");
-  const [fUrl, setFUrl]             = useState("");
+  const [fUrl, setFUrl]             = useState("");   // set after Cloudinary upload
   const [fDesc, setFDesc]           = useState("");
   const [fVis, setFVis]             = useState("private");
+  const [fFile, setFFile]           = useState(null); // the actual File object
+  const [fFileName, setFFileName]   = useState("");   // display name
+  const [fProgress, setFProgress]   = useState(0);
+  const [fUploading, setFUploading] = useState(false);
+  const [fUploadErr, setFUploadErr] = useState("");
 
   // ── Public library state ───────────────────────────────────────────────────
   const [pubNotes,   setPubNotes]   = useState([]);
@@ -779,6 +831,8 @@ function Library({ uid, userData, user, onUpdate }) {
   const resetForm = () => {
     setFTitle(""); setFCourse(""); setFType("PDF");
     setFUrl(""); setFDesc(""); setFVis("private");
+    setFFile(null); setFFileName(""); setFProgress(0);
+    setFUploading(false); setFUploadErr("");
     setEditTarget(null); setShowUpload(false);
   };
 
@@ -786,64 +840,74 @@ function Library({ uid, userData, user, onUpdate }) {
     setFTitle(note.title); setFCourse(note.course || "");
     setFType(note.type); setFUrl(note.url);
     setFDesc(note.description || ""); setFVis(note.visibility || "private");
+    // Show existing filename from URL (last segment)
+    setFFileName(note.originalName || note.url?.split("/").pop() || "Existing file");
+    setFFile(null); setFProgress(0); setFUploadErr("");
     setEditTarget(note); setShowUpload(true);
   };
 
-  // ── Save note (new or edit) ────────────────────────────────────────────────
-  const saveNote = () => {
-    if (!fTitle.trim() || !fUrl.trim()) return;
+  // Handle file selection
+  const handleFileSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_FILE_MB * 1024 * 1024) {
+      setFUploadErr(`File is too large. Maximum size is ${MAX_FILE_MB}MB.`); return;
+    }
+    setFUploadErr("");
+    setFFile(file);
+    setFFileName(file.name);
+    setFType(detectFileType(file.name));
+    // Auto-fill title from filename if title is empty
+    if (!fTitle) setFTitle(file.name.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " "));
+  };
+
+  // ── Save note (upload file first, then save note) ──────────────────────────
+  const saveNote = async () => {
+    if (!fTitle.trim()) return;
+    // On new note, a file must be selected
+    if (!editTarget && !fFile) { setFUploadErr("Please select a file to upload."); return; }
+
+    let finalUrl = fUrl; // reuse existing URL on edit if no new file picked
+
+    // If a new file was selected, upload it first
+    if (fFile) {
+      setFUploading(true); setFProgress(0); setFUploadErr("");
+      try {
+        finalUrl = await uploadToCloudinary(fFile, setFProgress);
+      } catch (e) {
+        setFUploadErr(e.message); setFUploading(false); return;
+      }
+      setFUploading(false);
+    }
+
+    const noteData = {
+      title: fTitle, course: fCourse, type: fType, url: finalUrl,
+      description: fDesc, visibility: fVis,
+      originalName: fFileName,
+    };
 
     if (editTarget) {
-      // Update in private store
-      const updated = myNotes.map(n => n.id === editTarget.id
-        ? { ...n, title: fTitle, course: fCourse, type: fType, url: fUrl, description: fDesc, visibility: fVis }
-        : n
-      );
+      const updated = myNotes.map(n => n.id === editTarget.id ? { ...n, ...noteData } : n);
       setMyNotes(updated); db.set(uid, "notes", updated);
 
       const wasPublic = editTarget.visibility !== "private";
       const isPublic  = fVis !== "private";
 
-      if (wasPublic && isPublic) {
-        // Update public store entry
-        publicStore.update(editTarget.id, {
-          title: fTitle, course: fCourse, type: fType, url: fUrl,
-          description: fDesc, visibility: fVis,
-          uploaderFaculty: profile.faculty, uploaderDepartment: profile.department,
-          uploaderLevel: profile.level,
-        });
-      } else if (wasPublic && !isPublic) {
-        // Pulled from public
-        publicStore.remove(editTarget.id);
-        showToast("Note moved to private library.");
-      } else if (!wasPublic && isPublic) {
-        // Newly shared
-        publicStore.add({
-          ...updated.find(n => n.id === editTarget.id),
-          uploaderUid: uid, uploaderName: profile.name,
-          uploaderFaculty: profile.faculty, uploaderDepartment: profile.department,
-          uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0,
-        });
+      if (wasPublic && isPublic)  publicStore.update(editTarget.id, { ...noteData, uploaderFaculty: profile.faculty, uploaderDepartment: profile.department, uploaderLevel: profile.level });
+      if (wasPublic && !isPublic) { publicStore.remove(editTarget.id); showToast("Note moved to private library."); }
+      if (!wasPublic && isPublic) {
+        publicStore.add({ ...updated.find(n => n.id === editTarget.id), uploaderUid: uid, uploaderName: profile.name, uploaderFaculty: profile.faculty, uploaderDepartment: profile.department, uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0 });
         showToast("Note is now shared!");
       }
       onUpdate(); resetForm();
     } else {
-      // New note
       const id   = genId();
-      const note = {
-        id, title: fTitle, course: fCourse, type: fType, url: fUrl,
-        description: fDesc, visibility: fVis, created: new Date().toISOString(),
-      };
+      const note = { id, ...noteData, created: new Date().toISOString() };
       const updated = [note, ...myNotes];
       setMyNotes(updated); db.set(uid, "notes", updated);
 
       if (fVis !== "private") {
-        publicStore.add({
-          ...note,
-          uploaderUid: uid, uploaderName: profile.name,
-          uploaderFaculty: profile.faculty, uploaderDepartment: profile.department,
-          uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0,
-        });
+        publicStore.add({ ...note, uploaderUid: uid, uploaderName: profile.name, uploaderFaculty: profile.faculty, uploaderDepartment: profile.department, uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0 });
         showToast("Note uploaded and shared!");
       } else {
         showToast("Note saved to your private library.");
@@ -925,7 +989,12 @@ function Library({ uid, userData, user, onUpdate }) {
       <Dropdown label="Course (optional)" value={fCourse} onChange={setFCourse} options={courseOpts} />
 
       <div style={S.row2}>
-        <Dropdown label="File Type" value={fType} onChange={setFType} options={FILE_TYPES} />
+        <div style={S.formGroup}>
+          <label style={S.label}>File Type</label>
+          <div style={{ ...S.input, background: GRAY, color: MUTED, display: "flex", alignItems: "center", gap: 6 }}>
+            {TYPE_ICON[fType] || "📎"} {fType}
+          </div>
+        </div>
         <div style={S.formGroup}>
           <label style={S.label}>Visibility <span style={{ color: RED }}>*</span></label>
           <select value={fVis} onChange={e => setFVis(e.target.value)} style={S.select}>
@@ -936,20 +1005,84 @@ function Library({ uid, userData, user, onUpdate }) {
         </div>
       </div>
 
-      {/* Dynamic visibility description */}
+      {/* Visibility info */}
       <div style={{ background: fVis === "private" ? "#FEF3C7" : BLUE_LIGHT,
         borderRadius: 8, padding: "10px 14px", marginTop: -8, marginBottom: 16,
         fontSize: 13, color: fVis === "private" ? "#92400E" : BLUE, fontWeight: 500 }}>
         {visInfo()}
       </div>
 
-      <Field label="File URL / Google Drive / Cloudinary Link" value={fUrl} onChange={setFUrl}
-        placeholder="https://drive.google.com/..." required />
-      <Field label="Description (optional)" value={fDesc} onChange={setFDesc}
-        placeholder="Briefly describe what this note covers..." />
+      {/* File picker */}
+      <div style={S.formGroup}>
+        <label style={S.label}>
+          {editTarget ? "Replace File (optional)" : "Select File"} <span style={{ color: RED }}>{!editTarget && "*"}</span>
+        </label>
 
-      <Btn onClick={saveNote} style={{ width: "100%" }}>
-        {editTarget ? "Save Changes" : fVis === "private" ? "Save to My Library" : "Upload & Share"}
+        <label htmlFor="lib-file-input" style={{
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+          gap: 8, padding: "20px 16px", border: `2px dashed ${fFile ? BLUE : BORDER}`,
+          borderRadius: 10, cursor: "pointer", background: fFile ? BLUE_LIGHT : GRAY,
+          transition: "all 0.2s",
+        }}>
+          <span style={{ fontSize: 32 }}>{fFile ? TYPE_ICON[fType] || "📎" : "📂"}</span>
+          {fFileName ? (
+            <>
+              <span style={{ fontWeight: 700, fontSize: 13, color: TEXT, textAlign: "center", wordBreak: "break-all" }}>
+                {fFileName}
+              </span>
+              <span style={{ fontSize: 11, color: MUTED }}>Tap to change file</span>
+            </>
+          ) : (
+            <>
+              <span style={{ fontWeight: 600, fontSize: 14, color: BLUE }}>Tap to choose a file</span>
+              <span style={{ fontSize: 11, color: MUTED }}>PDF, Word, PowerPoint, or Image · Max {MAX_FILE_MB}MB</span>
+            </>
+          )}
+        </label>
+        <input
+          id="lib-file-input"
+          type="file"
+          accept={ACCEPTED_TYPES}
+          onChange={handleFileSelect}
+          style={{ display: "none" }}
+        />
+      </div>
+
+      {/* Upload progress bar */}
+      {fUploading && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: MUTED, marginBottom: 6 }}>
+            <span>Uploading to Cloudinary…</span>
+            <span style={{ fontWeight: 700, color: BLUE }}>{fProgress}%</span>
+          </div>
+          <div style={{ background: BORDER, borderRadius: 6, height: 8, overflow: "hidden" }}>
+            <div style={{ background: BLUE, height: "100%", width: `${fProgress}%`, transition: "width 0.3s", borderRadius: 6 }} />
+          </div>
+        </div>
+      )}
+
+      {/* Upload error */}
+      {fUploadErr && (
+        <div style={{ background: "#FEE2E2", color: RED, padding: "10px 14px",
+          borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
+          {fUploadErr}
+        </div>
+      )}
+
+      <Field label="Description (optional)" value={fDesc} onChange={setFDesc}
+        placeholder="Briefly describe what this note covers…" />
+
+      <Btn
+        onClick={saveNote}
+        disabled={fUploading || (!editTarget && !fFile) || !fTitle.trim()}
+        style={{ width: "100%", opacity: (fUploading || (!editTarget && !fFile) || !fTitle.trim()) ? 0.6 : 1 }}
+      >
+        {fUploading
+          ? `Uploading… ${fProgress}%`
+          : editTarget
+            ? "Save Changes"
+            : fVis === "private" ? "Save to My Library" : "Upload & Share"
+        }
       </Btn>
     </Modal>
   );
@@ -1978,35 +2111,4 @@ export default function App() {
                   style={{ width: "100%", height: "100%", objectFit: "cover" }} />
               : (user.profile?.name?.[0] || "U")
             }
-          </div>
-        </div>
-      </nav>
-
-      {/* Page content — padded above bottom nav */}
-      <div style={{ paddingBottom: 80 }}>
-        {pages[tab]}
-      </div>
-
-      {/* Mobile bottom nav */}
-      <nav style={S.bottomNav}>
-        {TABS.map(t => (
-          <div key={t.id} onClick={() => setTab(t.id)}
-            style={{ ...S.bottomNavItem, color: tab === t.id ? BLUE : MUTED }}>
-            <span style={{ fontSize: 18 }}>{t.icon}</span>
-            <span style={{ ...S.bottomNavLabel, color: tab === t.id ? BLUE : MUTED }}>{t.label}</span>
-          </div>
-        ))}
-      </nav>
-
-      <style>{`
-        * { box-sizing: border-box; }
-        body { margin: 0; }
-        input:focus, select:focus { outline: 2px solid ${BLUE}40; border-color: ${BLUE} !important; }
-        ::-webkit-scrollbar { width: 4px; height: 4px; }
-        ::-webkit-scrollbar-track { background: #f1f5f9; }
-        ::-webkit-scrollbar-thumb { background: ${BLUE}60; border-radius: 4px; }
-      `}</style>
-    </div>
-  );
-}
-
+          
