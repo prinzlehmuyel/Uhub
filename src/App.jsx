@@ -1,26 +1,50 @@
 import { useState, useEffect } from "react";
 import emailjs from "@emailjs/browser";
+import {
+  registerStudent,
+  loginStudent,
+  logoutStudent,
+  watchAuthState,
+  updateStudentProfile,
+  resendVerificationEmail,
+  refreshEmailVerified,
+  requestPasswordReset,
+} from "./auth";
+import {
+  listenToCollection,
+  addItem,
+  updateItem,
+  deleteItem,
+  listenToPublicNotes,
+  addPublicNote,
+  updatePublicNote,
+  deletePublicNote,
+  incrementPublicNoteDownloads,
+  makeShareable,
+} from "./firestore";
 
-// ─── EMAILJS CONFIG (set these in your .env file) ─────────────────────────────
-const EJS_SERVICE_ID  = import.meta.env.VITE_EMAILJS_SERVICE_ID  || "";
-const EJS_TEMPLATE_ID = import.meta.env.VITE_EMAILJS_TEMPLATE_ID || "";
-const EJS_PUBLIC_KEY  = import.meta.env.VITE_EMAILJS_PUBLIC_KEY  || "";
+// ─── EMAILJS CONFIG — branded notifications ONLY ──────────────────────────────
+// Firebase Authentication now handles registration, login, sessions, email
+// verification, and password reset natively. EmailJS is kept purely for
+// optional custom-branded emails (e.g. a welcome email) — never for auth.
+const EJS_SERVICE_ID       = import.meta.env.VITE_EMAILJS_SERVICE_ID          || "";
+const EJS_WELCOME_TEMPLATE = import.meta.env.VITE_EMAILJS_WELCOME_TEMPLATE_ID || "";
+const EJS_PUBLIC_KEY       = import.meta.env.VITE_EMAILJS_PUBLIC_KEY          || "";
 
-// Send real verification email via EmailJS
-async function sendVerificationEmail(toEmail, toName, code) {
-  if (!EJS_SERVICE_ID || !EJS_TEMPLATE_ID || !EJS_PUBLIC_KEY) {
-    throw new Error(
-      "EmailJS is not configured. Add VITE_EMAILJS_SERVICE_ID, VITE_EMAILJS_TEMPLATE_ID and VITE_EMAILJS_PUBLIC_KEY to your .env file."
+// Fire-and-forget branded welcome email sent after a successful registration.
+// Non-blocking and non-critical: if it's not configured or fails, registration
+// still succeeds — we just log a warning.
+async function sendWelcomeEmail(toEmail, toName) {
+  if (!EJS_SERVICE_ID || !EJS_WELCOME_TEMPLATE || !EJS_PUBLIC_KEY) return;
+  try {
+    await emailjs.send(
+      EJS_SERVICE_ID,
+      EJS_WELCOME_TEMPLATE,
+      { to_email: toEmail, to_name: toName },
+      EJS_PUBLIC_KEY
     );
-  }
-  const result = await emailjs.send(
-    EJS_SERVICE_ID,
-    EJS_TEMPLATE_ID,
-    { to_email: toEmail, to_name: toName, verification_code: code },
-    EJS_PUBLIC_KEY
-  );
-  if (result.status !== 200) {
-    throw new Error(`EmailJS returned status ${result.status}: ${result.text}`);
+  } catch (e) {
+    console.warn("Welcome email failed to send (non-blocking):", e);
   }
 }
 
@@ -83,86 +107,12 @@ const GREEN      = "#10B981";
 const ORANGE     = "#F59E0B";
 const RED        = "#EF4444";
 
-// ─── MOCK DATABASE (localStorage — swap for Firebase later) ──────────────────
-const db = {
-  data: JSON.parse(localStorage.getItem("uhub_data") || "{}"),
-  save() { localStorage.setItem("uhub_data", JSON.stringify(this.data)); },
-  get(uid) { return this.data[uid] || this.initUser(uid); },
-  initUser(uid) {
-    this.data[uid] = {
-      profile: null, courses: [], assignments: [],
-      notes: [], flashcards: [], studyPlans: [],
-      examDates: [], gpaRecords: [],
-    };
-    return this.data[uid];
-  },
-  set(uid, key, value) {
-    if (!this.data[uid]) this.initUser(uid);
-    this.data[uid][key] = value;
-    this.save();
-  },
-};
-
-// ─── MOCK AUTH ────────────────────────────────────────────────────────────────
-const authStore = {
-  users: JSON.parse(localStorage.getItem("uhub_users") || "{}"),
-
-  // Generate a 6-digit code, store it, and return it
-  // The component is responsible for emailing it via sendVerificationEmail()
-  generateCode(email) {
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const codes = JSON.parse(localStorage.getItem("uhub_vcodes") || "{}");
-    codes[email] = code;
-    localStorage.setItem("uhub_vcodes", JSON.stringify(codes));
-    return code;
-  },
-
-  checkVerificationCode(email, entered) {
-    const codes = JSON.parse(localStorage.getItem("uhub_vcodes") || "{}");
-    return codes[email] === entered.trim();
-  },
-
-  markVerified(email) {
-    const codes = JSON.parse(localStorage.getItem("uhub_vcodes") || "{}");
-    delete codes[email];
-    localStorage.setItem("uhub_vcodes", JSON.stringify(codes));
-    // Mark user record as verified
-    const u = this.users[email];
-    if (u) { u.verified = true; localStorage.setItem("uhub_users", JSON.stringify(this.users)); }
-    // Update session
-    const session = JSON.parse(localStorage.getItem("uhub_session") || "{}");
-    session.emailVerified = true;
-    localStorage.setItem("uhub_session", JSON.stringify(session));
-    return session;
-  },
-
-  register(email, password, profile) {
-    if (this.users[email]) throw new Error("Email already registered");
-    const uid = "uid_" + Math.random().toString(36).slice(2);
-    this.users[email] = { uid, password, verified: false };
-    localStorage.setItem("uhub_users", JSON.stringify(this.users));
-    db.set(uid, "profile", profile);
-    const session = { uid, email, profile, emailVerified: false };
-    localStorage.setItem("uhub_session", JSON.stringify(session));
-    return session;
-  },
-
-  login(email, password) {
-    const u = this.users[email];
-    if (!u || u.password !== password) throw new Error("Invalid email or password");
-    const profile = db.get(u.uid).profile;
-    const session = { uid: u.uid, email, profile, emailVerified: u.verified === true };
-    localStorage.setItem("uhub_session", JSON.stringify(session));
-    return session;
-  },
-
-  logout() { localStorage.removeItem("uhub_session"); },
-
-  restore() {
-    const s = localStorage.getItem("uhub_session");
-    return s ? JSON.parse(s) : null;
-  },
-};
+// NOTE: All student data (courses, assignments, notes, flashcards,
+// gpaRecords, examDates, studyPlans) now lives in real Firestore under
+// students/{uid}/{collection}/{id} — see firestore.js. App() below sets up
+// live onSnapshot listeners for each collection and assembles them into
+// `userData`, so every component here just reads userData.<collection>
+// as its source of truth and calls addItem/updateItem/deleteItem to write.
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 // NOTE: named genId to avoid shadowing the `uid` prop in components
@@ -170,6 +120,22 @@ const genId = () => Math.random().toString(36).slice(2, 10);
 const gradePoints = { A: 5, B: 4, C: 3, D: 2, E: 1, F: 0 };
 const daysUntil = (date) => Math.ceil((new Date(date) - new Date()) / 86400000);
 const fmtDate   = (d) => new Date(d).toLocaleDateString("en-NG", { day: "numeric", month: "short", year: "numeric" });
+
+// Translate Firebase Auth error codes into student-friendly messages
+function authErrorMessage(e) {
+  const code = e?.code || "";
+  const map = {
+    "auth/email-already-in-use": "That email is already registered — try logging in instead.",
+    "auth/invalid-email":        "Please enter a valid email address.",
+    "auth/weak-password":        "Password must be at least 6 characters.",
+    "auth/user-not-found":       "Invalid email or password.",
+    "auth/wrong-password":       "Invalid email or password.",
+    "auth/invalid-credential":   "Invalid email or password.",
+    "auth/too-many-requests":    "Too many attempts — please wait a moment and try again.",
+    "auth/network-request-failed": "Network error — check your connection and try again.",
+  };
+  return map[code] || e?.message || "Something went wrong. Please try again.";
+}
 
 // ─── STYLES ───────────────────────────────────────────────────────────────────
 const S = {
@@ -300,7 +266,7 @@ const LEVELS = ["100 Level","200 Level","300 Level","400 Level","500 Level","600
 
 // ─── AUTH SCREEN ──────────────────────────────────────────────────────────────
 function AuthScreen({ onAuth }) {
-  const [mode, setMode]           = useState("login");
+  const [mode, setMode]           = useState("login"); // login | register | forgot
   const [email, setEmail]         = useState("");
   const [password, setPassword]   = useState("");
   const [name, setName]           = useState("");
@@ -310,21 +276,119 @@ function AuthScreen({ onAuth }) {
   const [error, setError]         = useState("");
   const [loading, setLoading]     = useState(false);
 
-  const submit = () => {
+  // ── Forgot password state ──────────────────────────────────────────────────
+  // Firebase sends the actual reset link + handles the password change itself,
+  // so we only need to track whether the request went out.
+  const [resetSent, setResetSent] = useState(false);
+  const [resending, setResending] = useState(false);
+
+  // ── Register / Log in (real Firebase Auth) ──────────────────────────────────
+  const submit = async () => {
     setError(""); setLoading(true);
     try {
       if (mode === "register") {
         if (!name || !email || !password || !faculty || !department || !level) {
           setError("Please fill in all fields"); setLoading(false); return;
         }
-        onAuth(authStore.register(email, password, { name, email, faculty, department, level }));
+        if (password.length < 6) {
+          setError("Password must be at least 6 characters."); setLoading(false); return;
+        }
+        const session = await registerStudent(email, password, { name, email, faculty, department, level });
+        // Branded welcome email — purely cosmetic, never blocks registration
+        sendWelcomeEmail(email, name);
+        onAuth(session);
       } else {
         if (!email || !password) { setError("Please fill in all fields"); setLoading(false); return; }
-        onAuth(authStore.login(email, password));
+        const session = await loginStudent(email, password);
+        onAuth(session);
       }
-    } catch (e) { setError(e.message); setLoading(false); }
+    } catch (e) {
+      setError(authErrorMessage(e));
+      setLoading(false);
+    }
   };
 
+  // ── Forgot password: Firebase sends the reset link directly ────────────────
+  const requestReset = async (isResend) => {
+    setError("");
+    if (!email.trim()) { setError("Please enter your email"); return; }
+
+    isResend ? setResending(true) : setLoading(true);
+    try {
+      await requestPasswordReset(email);
+      setResetSent(true);
+    } catch (e) {
+      setError(authErrorMessage(e));
+    } finally {
+      isResend ? setResending(false) : setLoading(false);
+    }
+  };
+
+  const backToLogin = () => {
+    setMode("login"); setError(""); setResetSent(false); setPassword("");
+  };
+
+  // ── FORGOT PASSWORD VIEW ────────────────────────────────────────────────────
+  if (mode === "forgot") {
+    return (
+      <div style={S.authWrap}>
+        <div style={S.authCard}>
+          <div style={{ textAlign: "center", marginBottom: 24 }}>
+            <div style={{ fontSize: 40, marginBottom: 8 }}>🔑</div>
+            <div style={{ fontSize: 22, fontWeight: 900, color: BLUE, letterSpacing: -0.5 }}>Reset your password</div>
+            <div style={{ fontSize: 13, color: MUTED, marginTop: 8, lineHeight: 1.6 }}>
+              {resetSent
+                ? <>We've sent a password reset link to<br /><strong style={{ color: TEXT }}>{email}</strong></>
+                : "Enter the email linked to your account and we'll send you a secure reset link."
+              }
+            </div>
+          </div>
+
+          {error && (
+            <div style={{ background: "#FEE2E2", color: RED, padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
+              {error}
+            </div>
+          )}
+
+          {resetSent ? (
+            <>
+              <div style={{ background: "#D1FAE5", border: "1px solid #10B981", borderRadius: 10, padding: 20, textAlign: "center", marginBottom: 16 }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>📩</div>
+                <div style={{ fontWeight: 700, color: "#065F46", fontSize: 15 }}>Check your inbox</div>
+                <div style={{ color: "#065F46", fontSize: 13, marginTop: 4, lineHeight: 1.5 }}>
+                  Open the email and tap the link to choose a new password, then come back and log in.
+                </div>
+              </div>
+              <div style={{ textAlign: "center", fontSize: 13, color: MUTED }}>
+                Didn't get it?{" "}
+                <span
+                  onClick={!resending ? () => requestReset(true) : undefined}
+                  style={{ color: resending ? MUTED : BLUE, fontWeight: 700, cursor: resending ? "default" : "pointer" }}
+                >
+                  {resending ? "Sending..." : "Resend link"}
+                </span>
+              </div>
+            </>
+          ) : (
+            <>
+              <Field label="Email" value={email} onChange={setEmail} type="email" placeholder="student@unimaid.edu.ng" required />
+              <Btn onClick={() => requestReset(false)} disabled={loading} style={{ width: "100%", padding: "12px 0", fontSize: 15, marginTop: 4 }}>
+                {loading ? "Sending link..." : "Send Reset Link"}
+              </Btn>
+            </>
+          )}
+
+          <div style={{ textAlign: "center", marginTop: 20 }}>
+            <span onClick={backToLogin} style={{ fontSize: 13, color: MUTED, cursor: "pointer", textDecoration: "underline" }}>
+              ← Back to Log In
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── LOGIN / REGISTER VIEW ───────────────────────────────────────────────────
   return (
     <div style={S.authWrap}>
       <div style={S.authCard}>
@@ -362,6 +426,15 @@ function AuthScreen({ onAuth }) {
         <Field label="Email" value={email} onChange={setEmail} type="email" placeholder="student@unimaid.edu.ng" required />
         <Field label="Password" value={password} onChange={setPassword} type="password" placeholder="••••••••" required />
 
+        {mode === "login" && (
+          <div style={{ textAlign: "right", marginTop: -10, marginBottom: 16 }}>
+            <span onClick={() => { setMode("forgot"); setError(""); setResetSent(false); }}
+              style={{ fontSize: 12.5, color: BLUE, fontWeight: 600, cursor: "pointer" }}>
+              Forgot password?
+            </span>
+          </div>
+        )}
+
         <Btn onClick={submit} disabled={loading} style={{ width: "100%", padding: "12px 0", fontSize: 15, marginTop: 4 }}>
           {loading ? "Please wait..." : mode === "login" ? "Log In to UHub" : "Create Account"}
         </Btn>
@@ -375,40 +448,46 @@ function AuthScreen({ onAuth }) {
 }
 
 // ─── EMAIL VERIFICATION SCREEN ────────────────────────────────────────────────
+// Firebase already emailed a verification LINK the moment the account was
+// created (see registerStudent in auth.js). This screen just waits for the
+// student to click it, then re-checks their Firebase Auth status.
 function EmailVerification({ user, onVerified }) {
-  const [code, setCode]       = useState("");
-  const [sending, setSending] = useState(false);
-  const [sent, setSent]       = useState(false);
-  const [sendError, setSendError] = useState("");
-  const [verifyError, setVerifyError] = useState("");
-  const [success, setSuccess] = useState(false);
+  const [checking, setChecking]   = useState(false);
+  const [resending, setResending] = useState(false);
+  const [notYet, setNotYet]       = useState(false);
+  const [error, setError]         = useState("");
+  const [resent, setResent]       = useState(false);
 
-  // Generate code and send email on mount
-  useEffect(() => { doSend(); }, []);
-
-  const doSend = async () => {
-    setSending(true); setSendError(""); setCode("");
+  const checkNow = async () => {
+    setChecking(true); setError(""); setNotYet(false);
     try {
-      const code = authStore.generateCode(user.email);
-      await sendVerificationEmail(user.email, user.profile?.name || "Student", code);
-      setSent(true);
+      const verified = await refreshEmailVerified();
+      if (verified) {
+        onVerified({ ...user, emailVerified: true });
+      } else {
+        setNotYet(true);
+      }
     } catch (e) {
-      // Show the real error so the problem is easy to diagnose
-      setSendError(e?.message || "Unknown error — check the browser console for details.");
-      console.error("EmailJS error:", e);
+      setError(authErrorMessage(e));
     } finally {
-      setSending(false);
+      setChecking(false);
     }
   };
 
-  const verify = () => {
-    if (code.length !== 6) { setVerifyError("Please enter the full 6-digit code"); return; }
-    if (!authStore.checkVerificationCode(user.email, code)) {
-      setVerifyError("Incorrect code — please check your email and try again."); return;
+  const resend = async () => {
+    setResending(true); setError(""); setResent(false);
+    try {
+      await resendVerificationEmail();
+      setResent(true);
+    } catch (e) {
+      setError(authErrorMessage(e));
+    } finally {
+      setResending(false);
     }
-    const updatedSession = authStore.markVerified(user.email);
-    setSuccess(true);
-    setTimeout(() => onVerified(updatedSession), 1400);
+  };
+
+  const switchAccount = async () => {
+    try { await logoutStudent(); } finally { window.location.reload(); }
   };
 
   return (
@@ -420,80 +499,53 @@ function EmailVerification({ user, onVerified }) {
           <div style={{ fontSize: 48, marginBottom: 8 }}>📧</div>
           <div style={{ fontSize: 22, fontWeight: 900, color: BLUE, letterSpacing: -0.5 }}>Verify your email</div>
           <div style={{ fontSize: 13, color: MUTED, marginTop: 8, lineHeight: 1.6 }}>
-            {sending
-              ? "Sending verification code..."
-              : <>A 6-digit code has been sent to<br /><strong style={{ color: TEXT }}>{user.email}</strong></>
-            }
+            We've sent a verification link to<br /><strong style={{ color: TEXT }}>{user.email}</strong>
           </div>
         </div>
 
-        {/* Send error */}
-        {sendError && (
-          <div style={{ background: "#FEE2E2", color: RED, padding: "12px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
-            <strong>Failed to send email:</strong> {sendError}
+        {error && (
+          <div style={{ background: "#FEE2E2", color: RED, padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
+            {error}
           </div>
         )}
 
-        {/* Success state */}
-        {success ? (
-          <div style={{ background: "#D1FAE5", border: "1px solid #10B981", borderRadius: 10, padding: "20px", textAlign: "center" }}>
-            <div style={{ fontSize: 32, marginBottom: 8 }}>✅</div>
-            <div style={{ fontWeight: 700, color: "#065F46", fontSize: 15 }}>Email verified!</div>
-            <div style={{ color: "#065F46", fontSize: 13, marginTop: 4 }}>Taking you to your dashboard...</div>
+        {notYet && (
+          <div style={{ background: "#FEF3C7", color: "#92400E", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
+            Still not verified — open the email and tap the link, then try again.
           </div>
-        ) : (
-          <>
-            {/* Verify error */}
-            {verifyError && (
-              <div style={{ background: "#FEE2E2", color: RED, padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
-                {verifyError}
-              </div>
-            )}
-
-            {/* Code input */}
-            <div style={S.formGroup}>
-              <label style={S.label}>Enter 6-digit code <span style={{ color: RED }}>*</span></label>
-              <input
-                value={code}
-                onChange={e => { setCode(e.target.value.replace(/\D/g, "").slice(0, 6)); setVerifyError(""); }}
-                placeholder="——————"
-                maxLength={6}
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                style={{ ...S.input, fontSize: 28, fontWeight: 800, letterSpacing: 10, textAlign: "center", padding: "14px" }}
-                onFocus={e => (e.target.style.borderColor = BLUE)}
-                onBlur={e  => (e.target.style.borderColor = BORDER)}
-              />
-              <div style={{ fontSize: 12, color: MUTED, marginTop: 6, textAlign: "center" }}>
-                Check your inbox and spam folder
-              </div>
-            </div>
-
-            <Btn
-              onClick={verify}
-              disabled={code.length !== 6 || sending}
-              style={{ width: "100%", padding: "13px 0", fontSize: 15 }}
-            >
-              Verify Email
-            </Btn>
-
-            {/* Resend */}
-            <div style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: MUTED }}>
-              Didn't receive it?{" "}
-              <span
-                onClick={!sending ? doSend : undefined}
-                style={{ color: sending ? MUTED : BLUE, fontWeight: 700, cursor: sending ? "default" : "pointer" }}
-              >
-                {sending ? "Sending..." : "Resend code"}
-              </span>
-            </div>
-          </>
         )}
+
+        {resent && (
+          <div style={{ background: "#D1FAE5", color: "#065F46", padding: "10px 14px", borderRadius: 8, fontSize: 13, marginBottom: 16 }}>
+            Verification email resent — check your inbox and spam folder.
+          </div>
+        )}
+
+        <div style={{ fontSize: 13, color: MUTED, textAlign: "center", marginBottom: 16, lineHeight: 1.6 }}>
+          1. Open the email from Firebase<br />
+          2. Tap the verification link<br />
+          3. Come back here and tap the button below
+        </div>
+
+        <Btn onClick={checkNow} disabled={checking} style={{ width: "100%", padding: "13px 0", fontSize: 15 }}>
+          {checking ? "Checking..." : "I've verified my email"}
+        </Btn>
+
+        {/* Resend */}
+        <div style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: MUTED }}>
+          Didn't receive it?{" "}
+          <span
+            onClick={!resending ? resend : undefined}
+            style={{ color: resending ? MUTED : BLUE, fontWeight: 700, cursor: resending ? "default" : "pointer" }}
+          >
+            {resending ? "Sending..." : "Resend verification email"}
+          </span>
+        </div>
 
         {/* Switch account */}
         <div style={{ textAlign: "center", marginTop: 20 }}>
           <span
-            onClick={() => { authStore.logout(); window.location.reload(); }}
+            onClick={switchAccount}
             style={{ fontSize: 13, color: MUTED, cursor: "pointer", textDecoration: "underline" }}
           >
             Use a different account
@@ -579,24 +631,35 @@ function Dashboard({ user, userData }) {
 }
 
 // ─── COURSES ──────────────────────────────────────────────────────────────────
-function Courses({ uid, userData, onUpdate }) {
-  const [courses, setCourses] = useState(userData.courses || []);
+function Courses({ uid, userData }) {
+  const courses = userData.courses || [];
   const [modal, setModal]     = useState(false);
   const [code, setCode]       = useState("");
   const [title, setTitle]     = useState("");
   const [units, setUnits]     = useState("3");
   const [semester, setSem]    = useState("1st Semester");
+  const [saving, setSaving]   = useState(false);
+  const [error, setError]     = useState("");
 
-  const save = () => {
+  const save = async () => {
     if (!code || !title) return;
-    const updated = [...courses, { id: genId(), code: code.toUpperCase(), title, units: Number(units), semester }];
-    setCourses(updated); db.set(uid, "courses", updated); onUpdate();
-    setModal(false); setCode(""); setTitle(""); setUnits("3");
+    setSaving(true); setError("");
+    try {
+      await addItem(uid, "courses", { code: code.toUpperCase(), title, units: Number(units), semester });
+      setModal(false); setCode(""); setTitle(""); setUnits("3");
+    } catch (e) {
+      setError(e?.message || "Failed to save course.");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const remove = (id) => {
-    const updated = courses.filter(c => c.id !== id);
-    setCourses(updated); db.set(uid, "courses", updated); onUpdate();
+  const remove = async (id) => {
+    try {
+      await deleteItem(uid, "courses", id);
+    } catch (e) {
+      console.warn("Failed to remove course:", e);
+    }
   };
 
   const sems = [...new Set(courses.map(c => c.semester))];
@@ -637,7 +700,8 @@ function Courses({ uid, userData, onUpdate }) {
           </div>
           <Field label="Course Title" value={title} onChange={setTitle} placeholder="e.g. Data Structures" required />
           <Dropdown label="Semester" value={semester} onChange={setSem} options={["1st Semester","2nd Semester"]} required />
-          <Btn onClick={save} style={{ width: "100%" }}>Save Course</Btn>
+          {error && <div style={{ fontSize: 13, color: RED, marginBottom: 10 }}>{error}</div>}
+          <Btn onClick={save} disabled={saving} style={{ width: "100%" }}>{saving ? "Saving..." : "Save Course"}</Btn>
         </Modal>
       )}
     </div>
@@ -645,31 +709,45 @@ function Courses({ uid, userData, onUpdate }) {
 }
 
 // ─── ASSIGNMENTS ──────────────────────────────────────────────────────────────
-function Assignments({ uid, userData, onUpdate }) {
-  const [assignments, setAssignments] = useState(userData.assignments || []);
+function Assignments({ uid, userData }) {
+  const assignments = userData.assignments || [];
   const [modal, setModal]   = useState(false);
   const [title, setTitle]   = useState("");
   const [course, setCourse] = useState("");
   const [deadline, setDL]   = useState("");
   const [notes, setNotes]   = useState("");
   const [filter, setFilter] = useState("all");
+  const [saving, setSaving] = useState(false);
+  const [error, setError]   = useState("");
   const courseOpts = (userData.courses || []).map(c => ({ value: c.code, label: `${c.code} - ${c.title}` }));
 
-  const save = () => {
+  const save = async () => {
     if (!title || !deadline) return;
-    const updated = [...assignments, { id: genId(), title, course, deadline, notes, done: false, created: new Date().toISOString() }];
-    setAssignments(updated); db.set(uid, "assignments", updated); onUpdate();
-    setModal(false); setTitle(""); setCourse(""); setDL(""); setNotes("");
+    setSaving(true); setError("");
+    try {
+      await addItem(uid, "assignments", { title, course, deadline, notes, done: false });
+      setModal(false); setTitle(""); setCourse(""); setDL(""); setNotes("");
+    } catch (e) {
+      setError(e?.message || "Failed to save assignment.");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const toggle = (id) => {
-    const updated = assignments.map(a => a.id === id ? { ...a, done: !a.done } : a);
-    setAssignments(updated); db.set(uid, "assignments", updated); onUpdate();
+  const toggle = async (a) => {
+    try {
+      await updateItem(uid, "assignments", a.id, { done: !a.done });
+    } catch (e) {
+      console.warn("Failed to update assignment:", e);
+    }
   };
 
-  const remove = (id) => {
-    const updated = assignments.filter(a => a.id !== id);
-    setAssignments(updated); db.set(uid, "assignments", updated); onUpdate();
+  const remove = async (id) => {
+    try {
+      await deleteItem(uid, "assignments", id);
+    } catch (e) {
+      console.warn("Failed to remove assignment:", e);
+    }
   };
 
   const filtered = assignments
@@ -700,7 +778,7 @@ function Assignments({ uid, userData, onUpdate }) {
           return (
             <div key={a.id} style={{ ...S.listItem, opacity: a.done ? 0.65 : 1 }}>
               <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flex: 1 }}>
-                <input type="checkbox" checked={a.done} onChange={() => toggle(a.id)}
+                <input type="checkbox" checked={a.done} onChange={() => toggle(a)}
                   style={{ marginTop: 3, accentColor: BLUE, width: 16, height: 16, cursor: "pointer" }} />
                 <div style={{ flex: 1 }}>
                   <div style={{ fontWeight: 600, fontSize: 14, textDecoration: a.done ? "line-through" : "none" }}>{a.title}</div>
@@ -726,7 +804,8 @@ function Assignments({ uid, userData, onUpdate }) {
           <Dropdown label="Course (optional)" value={course} onChange={setCourse} options={courseOpts} />
           <Field label="Deadline" value={deadline} onChange={setDL} type="date" required />
           <Field label="Notes (optional)" value={notes} onChange={setNotes} placeholder="Additional details..." />
-          <Btn onClick={save} style={{ width: "100%" }}>Save Assignment</Btn>
+          {error && <div style={{ fontSize: 13, color: RED, marginBottom: 10 }}>{error}</div>}
+          <Btn onClick={save} disabled={saving} style={{ width: "100%" }}>{saving ? "Saving..." : "Save Assignment"}</Btn>
         </Modal>
       )}
     </div>
@@ -734,25 +813,9 @@ function Assignments({ uid, userData, onUpdate }) {
 }
 
 // ─── LIBRARY SYSTEM ───────────────────────────────────────────────────────────
-
-// Shared public notes store — persists across all users in localStorage
-// When Firebase is connected, replace with a "publicNotes" Firestore collection
-const publicStore = {
-  getAll:  ()      => JSON.parse(localStorage.getItem("uhub_public_notes") || "[]"),
-  save:    (notes) => localStorage.setItem("uhub_public_notes", JSON.stringify(notes)),
-  add(note) {
-    const notes = this.getAll(); notes.unshift(note); this.save(notes);
-  },
-  remove(id) {
-    this.save(this.getAll().filter(n => n.id !== id));
-  },
-  update(id, changes) {
-    this.save(this.getAll().map(n => n.id === id ? { ...n, ...changes } : n));
-  },
-  incrementDownload(id) {
-    this.save(this.getAll().map(n => n.id === id ? { ...n, downloads: (n.downloads || 0) + 1 } : n));
-  },
-};
+// Public sharing now lives in a real top-level Firestore "publicNotes"
+// collection (see firestore.js) so notes are actually searchable across
+// different students on different devices — not just within one browser.
 
 // Profile-based access control
 function canViewNote(note, viewerProfile) {
@@ -781,15 +844,15 @@ const FILE_TYPES   = ["PDF", "Image", "PPTX", "DOCX", "Other"];
 const TYPE_ICON    = { PDF: "📄", PPTX: "📊", DOCX: "📝", Image: "🖼️", Other: "📎" };
 const VIS_VARIANT  = { private: "orange", public: "green", faculty: "blue", department: "blue", level: "blue", coursemates: "blue" };
 
-function Library({ uid, userData, user, onUpdate }) {
+function Library({ uid, userData, user }) {
   const profile    = user?.profile || {};
   const courseOpts = (userData.courses || []).map(c => ({ value: c.code, label: `${c.code} – ${c.title}` }));
 
   // ── Tab ────────────────────────────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState("private");
 
-  // ── Private library state ──────────────────────────────────────────────────
-  const [myNotes,  setMyNotes]  = useState(userData.notes || []);
+  // ── Private library state (live from Firestore via userData.notes) ────────
+  const myNotes = userData.notes || [];
   const [privSearch, setPrivSearch] = useState("");
   const [showUpload, setShowUpload] = useState(false);
   const [editTarget, setEditTarget] = useState(null);
@@ -807,8 +870,8 @@ function Library({ uid, userData, user, onUpdate }) {
   const [fUploading, setFUploading] = useState(false);
   const [fUploadErr, setFUploadErr] = useState("");
 
-  // ── Public library state ───────────────────────────────────────────────────
-  const [pubNotes,   setPubNotes]   = useState([]);
+  // ── Public library state (live from the top-level Firestore collection) ───
+  const [allPubNotes, setAllPubNotes] = useState([]);
   const [pubSearch,  setPubSearch]  = useState("");
   const [fCourseQ,   setFCourseQ]   = useState("");
   const [fDept,      setFDept]      = useState("");
@@ -818,13 +881,15 @@ function Library({ uid, userData, user, onUpdate }) {
   const [showFilter, setShowFilter] = useState(false);
   const [toast, setToast]           = useState("");
 
-  // Load public notes whenever tab switches to public
+  // Subscribe to public notes in real time — any student's upload/edit/
+  // unpublish anywhere shows up here live, filtered to what this viewer
+  // is allowed to see based on their own profile.
   useEffect(() => {
-    if (activeTab === "public") {
-      const visible = publicStore.getAll().filter(n => canViewNote(n, profile));
-      setPubNotes(visible);
-    }
-  }, [activeTab]);
+    const unsubscribe = listenToPublicNotes((notes) => setAllPubNotes(notes));
+    return unsubscribe;
+  }, []);
+
+  const pubNotes = allPubNotes.filter(n => canViewNote(n, profile));
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 3000); };
 
@@ -861,7 +926,7 @@ function Library({ uid, userData, user, onUpdate }) {
     if (!fTitle) setFTitle(file.name.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " "));
   };
 
-  // ── Save note (upload file first, then save note) ──────────────────────────
+  // ── Save note (upload file first, then save note to Firestore) ─────────────
   const saveNote = async () => {
     if (!fTitle.trim()) return;
     // On new note, a file must be selected
@@ -882,63 +947,65 @@ function Library({ uid, userData, user, onUpdate }) {
 
     const noteData = {
       title: fTitle, course: fCourse, type: fType, url: finalUrl,
-      description: fDesc, visibility: fVis,
-      originalName: fFileName,
+      description: fDesc, visibility: fVis, originalName: fFileName,
+    };
+    const publicPayload = {
+      ...noteData,
+      uploaderUid: uid, uploaderName: profile.name,
+      uploaderFaculty: profile.faculty, uploaderDepartment: profile.department, uploaderLevel: profile.level,
     };
 
-    if (editTarget) {
-      const updated = myNotes.map(n => n.id === editTarget.id ? { ...n, ...noteData } : n);
-      setMyNotes(updated); db.set(uid, "notes", updated);
+    try {
+      if (editTarget) {
+        await updateItem(uid, "notes", editTarget.id, noteData);
 
-      const wasPublic = editTarget.visibility !== "private";
-      const isPublic  = fVis !== "private";
+        const wasPublic = editTarget.visibility !== "private";
+        const isPublic  = fVis !== "private";
 
-      if (wasPublic && isPublic)  publicStore.update(editTarget.id, { ...noteData, uploaderFaculty: profile.faculty, uploaderDepartment: profile.department, uploaderLevel: profile.level });
-      if (wasPublic && !isPublic) { publicStore.remove(editTarget.id); showToast("Note moved to private library."); }
-      if (!wasPublic && isPublic) {
-        publicStore.add({ ...updated.find(n => n.id === editTarget.id), uploaderUid: uid, uploaderName: profile.name, uploaderFaculty: profile.faculty, uploaderDepartment: profile.department, uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0 });
-        showToast("Note is now shared!");
-      }
-      onUpdate(); resetForm();
-    } else {
-      const id   = genId();
-      const note = { id, ...noteData, created: new Date().toISOString() };
-      const updated = [note, ...myNotes];
-      setMyNotes(updated); db.set(uid, "notes", updated);
-
-      if (fVis !== "private") {
-        publicStore.add({ ...note, uploaderUid: uid, uploaderName: profile.name, uploaderFaculty: profile.faculty, uploaderDepartment: profile.department, uploaderLevel: profile.level, uploadDate: new Date().toISOString(), downloads: 0 });
-        showToast("Note uploaded and shared!");
+        if (wasPublic && isPublic)  await updatePublicNote(editTarget.id, publicPayload);
+        if (wasPublic && !isPublic) { await deletePublicNote(editTarget.id); showToast("Note moved to private library."); }
+        if (!wasPublic && isPublic) { await addPublicNote(editTarget.id, publicPayload); showToast("Note is now shared!"); }
       } else {
-        showToast("Note saved to your private library.");
+        const noteId = await addItem(uid, "notes", noteData);
+        if (fVis !== "private") {
+          await addPublicNote(noteId, publicPayload);
+          showToast("Note uploaded and shared!");
+        } else {
+          showToast("Note saved to your private library.");
+        }
       }
-      onUpdate(); resetForm();
+      resetForm();
+    } catch (e) {
+      setFUploadErr(e?.message || "Failed to save note. Please try again.");
     }
   };
 
   // ── Delete note ────────────────────────────────────────────────────────────
-  const deleteNote = (id) => {
-    const note    = myNotes.find(n => n.id === id);
-    const updated = myNotes.filter(n => n.id !== id);
-    setMyNotes(updated); db.set(uid, "notes", updated);
-    if (note?.visibility !== "private") publicStore.remove(id);
-    onUpdate();
+  const deleteNote = async (id) => {
+    const note = myNotes.find(n => n.id === id);
+    try {
+      await deleteItem(uid, "notes", id);
+      if (note?.visibility !== "private") await deletePublicNote(id);
+    } catch (e) {
+      console.warn("Failed to delete note:", e);
+    }
   };
 
   // ── Handle view/download from public library ───────────────────────────────
   const handleDownload = (note) => {
-    publicStore.incrementDownload(note.id);
-    setPubNotes(prev => prev.map(n => n.id === note.id ? { ...n, downloads: (n.downloads || 0) + 1 } : n));
+    incrementPublicNoteDownloads(note.id).catch(() => {});
     window.open(note.url, "_blank");
   };
 
   // ── Unpublish from public library (own notes only) ─────────────────────────
-  const unpublish = (noteId) => {
-    publicStore.remove(noteId);
-    setPubNotes(prev => prev.filter(n => n.id !== noteId));
-    const updated = myNotes.map(n => n.id === noteId ? { ...n, visibility: "private" } : n);
-    setMyNotes(updated); db.set(uid, "notes", updated);
-    onUpdate(); showToast("Note moved back to private library.");
+  const unpublish = async (noteId) => {
+    try {
+      await deletePublicNote(noteId);
+      await updateItem(uid, "notes", noteId, { visibility: "private" });
+      showToast("Note moved back to private library.");
+    } catch (e) {
+      console.warn("Failed to unpublish note:", e);
+    }
   };
 
   // ── Filtered lists ─────────────────────────────────────────────────────────
@@ -1245,7 +1312,7 @@ function Library({ uid, userData, user, onUpdate }) {
                     </div>
                   </div>
                   <div style={{ fontSize: 11, color: MUTED, textAlign: "right" }}>
-                    <div>{fmtDate(n.uploadDate)}</div>
+                    <div>{fmtDate(n.sharedAt)}</div>
                     <div style={{ color: BLUE, fontWeight: 600 }}>⬇ {n.downloads || 0} views</div>
                   </div>
                 </div>
@@ -1316,12 +1383,12 @@ function Library({ uid, userData, user, onUpdate }) {
 }
 
 // ─── FLASHCARDS ───────────────────────────────────────────────────────────────
-function Flashcards({ uid, userData, onUpdate }) {
-  const [decks, setDecks]           = useState(userData.flashcards || []);
+function Flashcards({ uid, userData }) {
+  const decks = userData.flashcards || [];
   const [modal, setModal]           = useState(false);
   const [deckName, setDeckName]     = useState("");
   const [deckCourse, setDeckCourse] = useState("");
-  const [activeDeck, setActiveDeck] = useState(null);
+  const [activeDeckId, setActiveDeckId] = useState(null);
   const [cardModal, setCardModal]   = useState(false);
   const [front, setFront]           = useState("");
   const [back, setBack]             = useState("");
@@ -1330,37 +1397,47 @@ function Flashcards({ uid, userData, onUpdate }) {
   const [flipped, setFlipped]       = useState(false);
   const courseOpts = (userData.courses || []).map(c => ({ value: c.code, label: `${c.code} - ${c.title}` }));
 
-  const saveDeck = () => {
+  // Derive the active deck from live Firestore data so it stays in sync
+  // (e.g. after adding a card or sharing) without any manual re-fetching.
+  const activeDeck = decks.find(d => d.id === activeDeckId) || null;
+
+  const saveDeck = async () => {
     if (!deckName) return;
-    const updated = [...decks, { id: genId(), name: deckName, course: deckCourse, cards: [], public: false }];
-    setDecks(updated); db.set(uid, "flashcards", updated); onUpdate();
-    setModal(false); setDeckName(""); setDeckCourse("");
+    try {
+      await addItem(uid, "flashcards", { name: deckName, course: deckCourse, cards: [], public: false });
+      setModal(false); setDeckName(""); setDeckCourse("");
+    } catch (e) {
+      console.warn("Failed to create deck:", e);
+    }
   };
 
-  const saveCard = () => {
+  const saveCard = async () => {
     if (!front || !back || !activeDeck) return;
-    const updated = decks.map(d => d.id === activeDeck.id
-      ? { ...d, cards: [...d.cards, { id: genId(), front, back }] }
-      : d
-    );
-    setDecks(updated); db.set(uid, "flashcards", updated);
-    setActiveDeck(updated.find(d => d.id === activeDeck.id));
-    onUpdate(); setCardModal(false); setFront(""); setBack("");
+    const updatedCards = [...activeDeck.cards, { id: genId(), front, back }];
+    try {
+      await updateItem(uid, "flashcards", activeDeck.id, { cards: updatedCards });
+      setCardModal(false); setFront(""); setBack("");
+    } catch (e) {
+      console.warn("Failed to add card:", e);
+    }
   };
 
-  const removeDeck = (id) => {
-    const updated = decks.filter(d => d.id !== id);
-    setDecks(updated); db.set(uid, "flashcards", updated); onUpdate();
+  const removeDeck = async (id) => {
+    try {
+      await deleteItem(uid, "flashcards", id);
+    } catch (e) {
+      console.warn("Failed to remove deck:", e);
+    }
   };
 
-  const shareDeck = (id) => {
-    const updated = decks.map(d => d.id === id ? { ...d, public: true } : d);
-    setDecks(updated); db.set(uid, "flashcards", updated);
-    const shared = JSON.parse(localStorage.getItem("uhub_shared") || "{}");
-    shared[id] = { ...updated.find(d => d.id === id), type: "flashcard", ownerUid: uid };
-    localStorage.setItem("uhub_shared", JSON.stringify(shared));
-    if (activeDeck?.id === id) setActiveDeck({ ...activeDeck, public: true });
-    onUpdate();
+  const shareDeck = async (id) => {
+    const deck = decks.find(d => d.id === id);
+    if (!deck) return;
+    try {
+      await makeShareable(uid, "flashcards", id, deck);
+    } catch (e) {
+      console.warn("Failed to share deck:", e);
+    }
   };
 
   // ── Quiz mode ──
@@ -1404,7 +1481,7 @@ function Flashcards({ uid, userData, onUpdate }) {
   if (activeDeck) return (
     <div style={S.page}>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
-        <Btn variant="outline" onClick={() => setActiveDeck(null)}>← Back</Btn>
+        <Btn variant="outline" onClick={() => setActiveDeckId(null)}>← Back</Btn>
         <h1 style={{ ...S.h1, margin: 0 }}>{activeDeck.name}</h1>
       </div>
       <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
@@ -1449,7 +1526,7 @@ function Flashcards({ uid, userData, onUpdate }) {
             action={<Btn onClick={() => setModal(true)}>Create First Deck</Btn>} />
         : <div style={S.grid2}>
           {decks.map(d => (
-            <div key={d.id} style={{ ...S.card, cursor: "pointer", margin: 0 }} onClick={() => setActiveDeck(d)}>
+            <div key={d.id} style={{ ...S.card, cursor: "pointer", margin: 0 }} onClick={() => setActiveDeckId(d.id)}>
               <div style={{ fontSize: 28, marginBottom: 8 }}>🃏</div>
               <div style={{ fontWeight: 700, fontSize: 15 }}>{d.name}</div>
               {d.course && <div style={S.muted}>{d.course}</div>}
@@ -1506,9 +1583,9 @@ function classifyGPA(v) {
   return { label: "—", color: MUTED };
 }
 
-function GPA({ uid, userData, onUpdate }) {
+function GPA({ uid, userData }) {
   const courses = userData.courses || [];
-  const [records, setRecords] = useState(userData.gpaRecords || []);
+  const records = userData.gpaRecords || [];
   const [grades, setGrades]   = useState({});
   const [semester, setSem]    = useState("1st Semester");
   const [saved, setSaved]     = useState(false);
@@ -1549,7 +1626,7 @@ function GPA({ uid, userData, onUpdate }) {
     return (prevUnits + curUnits) > 0 ? (prevPts + curPts) / (prevUnits + curUnits) : 0;
   };
 
-  const saveRecord = () => {
+  const saveRecord = async () => {
     if (gradedCount === 0) return;
     let tp = 0, tu = 0;
     semCourses.forEach(c => {
@@ -1558,21 +1635,32 @@ function GPA({ uid, userData, onUpdate }) {
     });
     // Pass computed tp/tu directly so CGPA isn't calculated from stale state
     const cgpa = calcCGPA(tp, tu);
-    const rec = {
-      id: genId(), semester,
+    const recFields = {
+      semester,
       gpa: calcGPA(), cgpa,
       totalPoints: tp, totalUnits: tu,
       date: new Date().toISOString(),
     };
-    const updated = [...records.filter(r => r.semester !== semester), rec]
-      .sort((a, b) => a.semester.localeCompare(b.semester));
-    setRecords(updated); db.set(uid, "gpaRecords", updated); onUpdate();
-    setSaved(true); setTimeout(() => setSaved(false), 2500);
+    try {
+      // One record per semester — update it if it already exists, else create it
+      const existing = records.find(r => r.semester === semester);
+      if (existing) {
+        await updateItem(uid, "gpaRecords", existing.id, recFields);
+      } else {
+        await addItem(uid, "gpaRecords", recFields);
+      }
+      setSaved(true); setTimeout(() => setSaved(false), 2500);
+    } catch (e) {
+      console.warn("Failed to save GPA record:", e);
+    }
   };
 
-  const deleteRecord = (id) => {
-    const updated = records.filter(r => r.id !== id);
-    setRecords(updated); db.set(uid, "gpaRecords", updated); onUpdate();
+  const deleteRecord = async (id) => {
+    try {
+      await deleteItem(uid, "gpaRecords", id);
+    } catch (e) {
+      console.warn("Failed to delete GPA record:", e);
+    }
   };
 
   const gpa   = calcGPA();
@@ -1730,8 +1818,8 @@ function GPA({ uid, userData, onUpdate }) {
 }
 
 // ─── EXAM COUNTDOWN ───────────────────────────────────────────────────────────
-function ExamCountdown({ uid, userData, onUpdate }) {
-  const [exams, setExams] = useState(userData.examDates || []);
+function ExamCountdown({ uid, userData }) {
+  const exams = userData.examDates || [];
   const [modal, setModal] = useState(false);
   const [course, setCourse] = useState("");
   const [date, setDate]     = useState("");
@@ -1739,16 +1827,22 @@ function ExamCountdown({ uid, userData, onUpdate }) {
   const [venue, setVenue]   = useState("");
   const courseOpts = (userData.courses || []).map(c => ({ value: c.code, label: `${c.code} - ${c.title}` }));
 
-  const save = () => {
+  const save = async () => {
     if (!course || !date) return;
-    const updated = [...exams, { id: genId(), course, date, time, venue }];
-    setExams(updated); db.set(uid, "examDates", updated); onUpdate();
-    setModal(false); setCourse(""); setDate(""); setTime(""); setVenue("");
+    try {
+      await addItem(uid, "examDates", { course, date, time, venue });
+      setModal(false); setCourse(""); setDate(""); setTime(""); setVenue("");
+    } catch (e) {
+      console.warn("Failed to save exam:", e);
+    }
   };
 
-  const remove = (id) => {
-    const updated = exams.filter(e => e.id !== id);
-    setExams(updated); db.set(uid, "examDates", updated); onUpdate();
+  const remove = async (id) => {
+    try {
+      await deleteItem(uid, "examDates", id);
+    } catch (e) {
+      console.warn("Failed to remove exam:", e);
+    }
   };
 
   const sorted   = [...exams].sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -1822,8 +1916,8 @@ function ExamCountdown({ uid, userData, onUpdate }) {
 }
 
 // ─── STUDY PLANNER ────────────────────────────────────────────────────────────
-function StudyPlanner({ uid, userData, onUpdate }) {
-  const [plans, setPlans]     = useState(userData.studyPlans || []);
+function StudyPlanner({ uid, userData }) {
+  const plans = userData.studyPlans || [];
   const [modal, setModal]     = useState(false);
   const [task, setTask]       = useState("");
   const [course, setCourse]   = useState("");
@@ -1834,21 +1928,30 @@ function StudyPlanner({ uid, userData, onUpdate }) {
   const courseOpts = (userData.courses || []).map(c => ({ value: c.code, label: `${c.code} - ${c.title}` }));
   const today = new Date().toISOString().slice(0, 10);
 
-  const save = () => {
+  const save = async () => {
     if (!task || !planDate) return;
-    const updated = [...plans, { id: genId(), task, course, date: planDate, duration: Number(duration), goal, done: false }];
-    setPlans(updated); db.set(uid, "studyPlans", updated); onUpdate();
-    setModal(false); setTask(""); setCourse(""); setPlanDate(""); setGoal("");
+    try {
+      await addItem(uid, "studyPlans", { task, course, date: planDate, duration: Number(duration), goal, done: false });
+      setModal(false); setTask(""); setCourse(""); setPlanDate(""); setGoal("");
+    } catch (e) {
+      console.warn("Failed to save study session:", e);
+    }
   };
 
-  const toggle = (id) => {
-    const updated = plans.map(p => p.id === id ? { ...p, done: !p.done } : p);
-    setPlans(updated); db.set(uid, "studyPlans", updated); onUpdate();
+  const toggle = async (p) => {
+    try {
+      await updateItem(uid, "studyPlans", p.id, { done: !p.done });
+    } catch (e) {
+      console.warn("Failed to update study session:", e);
+    }
   };
 
-  const remove = (id) => {
-    const updated = plans.filter(p => p.id !== id);
-    setPlans(updated); db.set(uid, "studyPlans", updated); onUpdate();
+  const remove = async (id) => {
+    try {
+      await deleteItem(uid, "studyPlans", id);
+    } catch (e) {
+      console.warn("Failed to remove study session:", e);
+    }
   };
 
   const filtered = plans
@@ -1893,7 +1996,7 @@ function StudyPlanner({ uid, userData, onUpdate }) {
             action={<Btn onClick={() => setModal(true)}>Plan a Session</Btn>} />
         : filtered.map(p => (
           <div key={p.id} style={{ ...S.listItem, opacity: p.done ? 0.6 : 1 }}>
-            <input type="checkbox" checked={p.done} onChange={() => toggle(p.id)}
+            <input type="checkbox" checked={p.done} onChange={() => toggle(p)}
               style={{ marginTop: 3, accentColor: BLUE, width: 16, height: 16, cursor: "pointer" }} />
             <div style={{ flex: 1 }}>
               <div style={{ fontWeight: 600, fontSize: 14, textDecoration: p.done ? "line-through" : "none" }}>{p.task}</div>
@@ -1925,47 +2028,57 @@ function StudyPlanner({ uid, userData, onUpdate }) {
 }
 
 // ─── PROFILE ──────────────────────────────────────────────────────────────────
-function Profile({ user, onLogout, onUpdate }) {
-  const [profile, setProfile]     = useState(user.profile || {});
-  const [saved, setSaved]         = useState(false);
-  const [uploading, setUploading] = useState(false);
+function Profile({ user, onLogout, onProfileUpdate }) {
+  const [profile, setProfile]       = useState(user.profile || {});
+  const [saving, setSaving]         = useState(false);
+  const [saved, setSaved]           = useState(false);
+  const [saveError, setSaveError]   = useState("");
+  const [uploading, setUploading]   = useState(false);
   const [photoError, setPhotoError] = useState("");
 
-  const save = () => {
-    db.set(user.uid, "profile", profile);
-    const session = JSON.parse(localStorage.getItem("uhub_session") || "{}");
-    localStorage.setItem("uhub_session", JSON.stringify({ ...session, profile }));
-    setSaved(true); setTimeout(() => setSaved(false), 2000); onUpdate();
+  const save = async () => {
+    setSaving(true); setSaveError("");
+    try {
+      await updateStudentProfile(user.uid, profile);
+      onProfileUpdate(profile);
+      setSaved(true); setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setSaveError(e?.message || "Failed to save changes. Please try again.");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  // Convert selected image to base64 and store in profile
-  const handlePhotoChange = (e) => {
+  // Upload to Cloudinary and store just the URL — Firestore documents cap
+  // out at 1MB, so a base64-encoded photo would risk breaking profile saves.
+  const handlePhotoChange = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (!file.type.startsWith("image/")) { setPhotoError("Please select an image file"); return; }
     if (file.size > 2 * 1024 * 1024) { setPhotoError("Image must be under 2MB"); return; }
     setPhotoError(""); setUploading(true);
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const updated = { ...profile, photoURL: ev.target.result };
+    try {
+      const url = await uploadToCloudinary(file);
+      const updated = { ...profile, photoURL: url };
       setProfile(updated);
-      db.set(user.uid, "profile", updated);
-      const session = JSON.parse(localStorage.getItem("uhub_session") || "{}");
-      localStorage.setItem("uhub_session", JSON.stringify({ ...session, profile: updated }));
+      await updateStudentProfile(user.uid, { photoURL: url });
+      onProfileUpdate(updated);
+    } catch (err) {
+      setPhotoError(err?.message || "Failed to upload photo.");
+    } finally {
       setUploading(false);
-      onUpdate();
-    };
-    reader.onerror = () => { setPhotoError("Failed to read image"); setUploading(false); };
-    reader.readAsDataURL(file);
+    }
   };
 
-  const removePhoto = () => {
+  const removePhoto = async () => {
     const updated = { ...profile, photoURL: null };
     setProfile(updated);
-    db.set(user.uid, "profile", updated);
-    const session = JSON.parse(localStorage.getItem("uhub_session") || "{}");
-    localStorage.setItem("uhub_session", JSON.stringify({ ...session, profile: updated }));
-    onUpdate();
+    try {
+      await updateStudentProfile(user.uid, { photoURL: null });
+    } catch (err) {
+      setPhotoError(err?.message || "Failed to remove photo.");
+    }
+    onProfileUpdate(updated);
   };
 
   return (
@@ -2024,7 +2137,10 @@ function Profile({ user, onLogout, onUpdate }) {
         <Dropdown label="Faculty" value={profile.faculty || ""} onChange={v => setProfile({ ...profile, faculty: v })} options={FACULTIES} required />
         <Field label="Department" value={profile.department || ""} onChange={v => setProfile({ ...profile, department: v })} placeholder="e.g. Computer Science" required />
         <Dropdown label="Level" value={profile.level || ""} onChange={v => setProfile({ ...profile, level: v })} options={LEVELS} required />
-        <Btn onClick={save} variant={saved ? "green" : "blue"}>{saved ? "✓ Saved!" : "Save Changes"}</Btn>
+        {saveError && <div style={{ fontSize: 13, color: RED, marginBottom: 10 }}>{saveError}</div>}
+        <Btn onClick={save} disabled={saving} variant={saved ? "green" : "blue"}>
+          {saving ? "Saving..." : saved ? "✓ Saved!" : "Save Changes"}
+        </Btn>
       </div>
 
       {/* Account actions */}
@@ -2054,26 +2170,58 @@ const TABS = [
 ];
 
 export default function App() {
-  const [user, setUser]         = useState(null);
-  const [tab, setTab]           = useState("dashboard");
-  const [userData, setUserData] = useState({});
+  const [user, setUser]           = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [tab, setTab]             = useState("dashboard");
+  const [userData, setUserData]   = useState({});
 
+  // Subscribe to real Firebase Auth state. This replaces the old
+  // localStorage session restore — Firebase keeps `user` in sync
+  // automatically (login, logout, token refresh) across the whole app.
   useEffect(() => {
-    const u = authStore.restore();
-    if (u) { setUser(u); setUserData(db.get(u.uid)); }
+    const unsubscribe = watchAuthState((u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return unsubscribe;
   }, []);
 
-  const handleAuth     = (u) => { setUser(u); setUserData(db.get(u.uid)); };
-  const handleVerified = (u) => { setUser(u); setUserData(db.get(u.uid)); };
-  const handleLogout   = () => { authStore.logout(); setUser(null); setTab("dashboard"); };
-  const handleUpdate   = () => {
-    if (user) {
-      // Re-read profile from localStorage in case photo was updated
-      const session = JSON.parse(localStorage.getItem("uhub_session") || "{}");
-      setUser(prev => ({ ...prev, profile: session.profile || prev.profile }));
-      setUserData({ ...db.get(user.uid) });
-    }
+  // Live Firestore listeners for every collection of student data. Any
+  // add/edit/delete anywhere in the app — or on another device — flows
+  // back here automatically and re-renders the active page. No more
+  // manual onUpdate() refresh calls anywhere in the app.
+  useEffect(() => {
+    if (!user) { setUserData({}); return; }
+    const collections = ["courses", "assignments", "notes", "flashcards", "gpaRecords", "examDates", "studyPlans"];
+    const unsubscribers = collections.map(col =>
+      listenToCollection(user.uid, col, (items) => {
+        setUserData(prev => ({ ...prev, [col]: items }));
+      })
+    );
+    return () => unsubscribers.forEach(unsub => unsub());
+  }, [user?.uid]);
+
+  const handleAuth          = (u) => setUser(u);
+  const handleVerified      = (u) => setUser(u);
+  const handleProfileUpdate = (updatedProfile) => {
+    setUser(prev => prev ? { ...prev, profile: updatedProfile } : prev);
   };
+  const handleLogout = async () => {
+    try { await logoutStudent(); } finally { setUser(null); setTab("dashboard"); }
+  };
+
+  // Wait for Firebase to report the initial auth state before deciding what
+  // to render — avoids a flash of the login screen for already-signed-in students.
+  if (authLoading) {
+    return (
+      <div style={S.authWrap}>
+        <div style={{ textAlign: "center", color: MUTED }}>
+          <div style={{ fontSize: 36, marginBottom: 8 }}>🎓</div>
+          Loading UHub...
+        </div>
+      </div>
+    );
+  }
 
   if (!user) return <AuthScreen onAuth={handleAuth} />;
 
@@ -2082,14 +2230,14 @@ export default function App() {
 
   const pages = {
     dashboard:   <Dashboard   user={user}  userData={userData} />,
-    courses:     <Courses     uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
-    assignments: <Assignments uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
-    notes:       <Library     uid={user.uid} userData={userData} user={user} onUpdate={handleUpdate} />,
-    flashcards:  <Flashcards  uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
-    gpa:         <GPA         uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
-    exams:       <ExamCountdown uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
-    planner:     <StudyPlanner  uid={user.uid} userData={userData} onUpdate={handleUpdate} />,
-    profile:     <Profile user={user} onLogout={handleLogout} onUpdate={handleUpdate} />,
+    courses:     <Courses     uid={user.uid} userData={userData} />,
+    assignments: <Assignments uid={user.uid} userData={userData} />,
+    notes:       <Library     uid={user.uid} userData={userData} user={user} />,
+    flashcards:  <Flashcards  uid={user.uid} userData={userData} />,
+    gpa:         <GPA         uid={user.uid} userData={userData} />,
+    exams:       <ExamCountdown uid={user.uid} userData={userData} />,
+    planner:     <StudyPlanner  uid={user.uid} userData={userData} />,
+    profile:     <Profile user={user} onLogout={handleLogout} onProfileUpdate={handleProfileUpdate} />,
   };
 
   return (
