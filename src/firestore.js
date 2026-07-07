@@ -17,6 +17,23 @@ import {
   updateDoc,
 } from "firebase/firestore";
 
+// ── Generic top-level collection helpers (faculties, departments, levels,
+// courses catalog, announcements) — admin-managed reference data that every
+// signed-in student reads live. This was missing from this file even though
+// the student app imports and relies on it (registration/profile dropdowns,
+// announcements) — without it those features fail outright.
+export function listenToTopCollection(collectionName, callback, onError) {
+  const ref = collection(db, collectionName);
+  return onSnapshot(
+    ref,
+    (snap) => callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+    (err) => {
+      console.error(`[UHub] listenToTopCollection("${collectionName}") failed:`, err);
+      if (onError) onError(err);
+    }
+  );
+}
+
 // ── Generic helpers for any subcollection ──────────────────────
 // subcollection: "courses" | "assignments" | "notes" | "flashcards" | "studyPlans" | "examDates" | "gpaRecords"
 
@@ -91,11 +108,16 @@ export async function incrementPublicNoteViews(noteId) {
 }
 
 // ── ANNOUNCEMENTS (read-only here — published by the admin dashboard) ──────
-export function listenToAnnouncements(callback) {
+export function listenToAnnouncements(callback, onError) {
   const ref = collection(db, "announcements");
-  return onSnapshot(ref, (snap) => {
-    callback(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-  });
+  return onSnapshot(
+    ref,
+    (snap) => callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+    (err) => {
+      console.error("[UHub] listenToAnnouncements failed:", err);
+      if (onError) onError(err);
+    }
+  );
 }
 
 // ── SHARE LINKS ─────────────────────────────────────────────────
